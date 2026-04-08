@@ -1,17 +1,28 @@
 #!/usr/bin/env python3
 """
-extrair_processos.py - Extrai texto de PDFs de processos judiciais (PJe/TJBA)
-Remove cabecalhos/rodapes repetitivos, aplica OCR quando necessario,
-gera arquivos .txt limpos com referencia de pagina.
+extrair_processos_v2.py — Extrai texto de PDFs de processos judiciais (PJe/TJBA)
 
-100% Python — nao depende de pdftotext, pdftoppm, pdfinfo, tesseract CLI.
+MELHORIAS v2:
+  1. DETECÇÃO DE SCAN ROBUSTA (5 heurísticas combinadas):
+     - Razão texto/área da página (principal)
+     - Presença de imagens grandes via pdfplumber
+     - Análise de objetos XObject no PDF (PyMuPDF ou pypdf)
+     - Densidade de caracteres por linha
+     - Fallback: renderizar a página e medir pixels brancos
+  2. FORMATO DE SAÍDA EM MARKDOWN ESTRUTURADO:
+     - Muito melhor para LLMs do que txt plano
+     - Hierarquia clara: cabeçalho > índice > peças
+     - Metadados como frontmatter YAML
+     - Peças completas com delimitadores claros
+     - Compatível com qualquer editor e ferramenta
 
-DEPENDENCIAS (pip install):
-    pip install pdfplumber pypdf Pillow pytesseract
-    (pytesseract so e necessario se houver paginas escaneadas)
+DEPENDENCIAS:
+    pip install pdfplumber pypdf
+    pip install pytesseract Pillow         (OCR — recomendado)
+    pip install PyMuPDF                    (melhor detecção de scan — opcional)
 
 USO:
-    python scripts/extrair_processos.py
+    python3 scripts/extrair_processos_v2.py
 """
 
 import os
@@ -20,546 +31,793 @@ import csv
 import sys
 import json
 import time
-import traceback
 from pathlib import Path
+from datetime import datetime
 
 # ============================================================
-# CONFIGURACOES
+# CONFIGURAÇÕES
 # ============================================================
-DIR_PDFS = Path("pdfs")
-DIR_SAIDA = Path("textos_extraidos")
+DIR_PDFS        = Path("pdfs")
+DIR_SAIDA       = Path("textos_extraidos")
 DIR_SAIDA.mkdir(exist_ok=True)
 
-CSV_PROCESSOS = "processos_crime_parados_mais_que_100_dias.csv"
-RELATORIO_PATH = Path("relatorio_extracao.json")
+CSV_PROCESSOS   = "processos_crime_parados_mais_que_100_dias.csv"
+RELATORIO_PATH  = Path("relatorio_extracao.json")
 MAPEAMENTO_PATH = Path("mapeamento_processos.json")
 
-MIN_CHARS_TEXTO = 30
+# Thresholds de detecção de scan
+MIN_CHARS_PAGINA        = 50     # mínimo de chars para considerar página com texto
+SCAN_CHARS_POR_AREA     = 0.005  # menos que isso (chars/pt²) → provavelmente scan
+SCAN_IMG_MIN_FRAC       = 0.3    # imagem cobre >30% da área → candidato a scan
+SCAN_LINHAS_CURTAS_FRAC = 0.8    # >80% das linhas têm <5 chars → scan (OCR fragmentado)
+
+# Peças que recebem conteúdo COMPLETO vs RESUMIDO
+PECAS_COMPLETAS = {"DENUNCIA", "SENTENCA", "DECISAO", "DESPACHO", "ATA",
+                   "PRONUNCIA", "ALEGACOES", "RESPOSTA", "RECURSO", "LAUDO"}
+PECAS_RESUMO    = {"CERTIDAO", "INTIMACAO", "OFICIO", "MANDADO", "ALVARA", "PETICAO"}
+
 
 # ============================================================
 # PROGRESSO
 # ============================================================
-
 class Progresso:
-    """Exibe progresso em tempo real no terminal."""
-
-    def __init__(self, total_pdfs):
-        self.total_pdfs = total_pdfs
-        self.pdf_atual = 0
-        self.pdf_nome = ""
-        self.pag_atual = 0
-        self.pag_total = 0
+    def __init__(self, total):
+        self.total = total
+        self.atual = 0
         self.inicio = time.time()
         self.inicio_pdf = time.time()
 
-    def novo_pdf(self, indice, nome, total_paginas):
-        self.pdf_atual = indice
-        self.pdf_nome = nome
-        self.pag_atual = 0
-        self.pag_total = total_paginas
+    def novo_pdf(self, idx, nome, n_pags):
+        self.atual = idx
         self.inicio_pdf = time.time()
-        pct_global = ((indice - 1) / self.total_pdfs) * 100
-        print(f"\n[{indice}/{self.total_pdfs}] ({pct_global:.1f}%) {nome}")
-        print(f"  {total_paginas} paginas | ", end="", flush=True)
+        pct = (idx - 1) / self.total * 100
+        print(f"\n[{idx}/{self.total}] ({pct:.1f}%) {nome}")
+        print(f"  {n_pags} págs | ", end="", flush=True)
 
-    def pagina(self, pag_num, tipo="txt"):
-        self.pag_atual = pag_num
-        pct_pag = (pag_num / self.pag_total) * 100 if self.pag_total > 0 else 0
+    def pagina(self, n, total, tipo):
+        simbolos = {"txt": "#", "ocr": "O", "scan": "S", "vazia": ".", "ocr_fail": "X"}
+        step = max(1, total // 30)
+        if n % step == 0 or n <= 1 or n == total:
+            print(simbolos.get(tipo, "?"), end="", flush=True)
 
-        # Barra de progresso compacta a cada 10% ou nas ultimas paginas
-        marcadores = {10, 20, 30, 40, 50, 60, 70, 80, 90, 100}
-        pct_int = int(pct_pag)
-        if pct_int in marcadores or pag_num == self.pag_total or pag_num <= 1:
-            if tipo == "ocr":
-                marcador = "O"
-            elif tipo == "vazia":
-                marcador = "."
-            else:
-                marcador = "#"
-            print(marcador, end="", flush=True)
-
-        if pag_num == self.pag_total:
-            elapsed = time.time() - self.inicio_pdf
-            print(f" | {elapsed:.1f}s", end="", flush=True)
-
-    def pdf_concluido(self, resultado):
-        if resultado["status"] == "OK":
-            chars = resultado.get("chars", 0)
-            tokens = resultado.get("tokens_aprox", 0)
-            pecas = resultado.get("documentos_detectados", 0)
-            txt = resultado.get("paginas_texto", 0)
-            ocr = resultado.get("paginas_ocr", 0)
-            vazias = resultado.get("paginas_vazias", 0)
-            print(f"\n  OK: {tokens:,} tokens, {pecas} pecas, "
-                  f"texto:{txt} ocr:{ocr} vazias:{vazias} -> {resultado['arquivo_saida']}")
+    def concluido(self, r):
+        t = time.time() - self.inicio_pdf
+        if r["status"] == "OK":
+            print(f" | {t:.1f}s")
+            print(f"  → {r['tokens_aprox']:,} tok | {r['documentos_detectados']} peças | "
+                  f"txt:{r['pags_texto']} ocr:{r['pags_ocr']} "
+                  f"scan:{r['pags_scan']} vazia:{r['pags_vazias']}")
+            if r.get("pags_scan", 0) > 0 and not r.get("ocr_disponivel"):
+                print(f"  ⚠ {r['pags_scan']} pág(s) escaneadas sem OCR — instale Tesseract")
         else:
-            print(f"\n  ERRO: {resultado.get('erro', '?')}")
+            print(f" | ERRO: {r.get('erro', '?')}")
 
-    def resumo_tempo(self):
-        total = time.time() - self.inicio
-        horas = int(total // 3600)
-        minutos = int((total % 3600) // 60)
-        segundos = int(total % 60)
-        if horas > 0:
-            return f"{horas}h{minutos:02d}m{segundos:02d}s"
-        elif minutos > 0:
-            return f"{minutos}m{segundos:02d}s"
-        else:
-            return f"{segundos}s"
+    def tempo_total(self):
+        t = time.time() - self.inicio
+        h, m, s = int(t // 3600), int((t % 3600) // 60), int(t % 60)
+        return f"{h}h{m:02d}m{s:02d}s" if h else (f"{m}m{s:02d}s" if m else f"{s}s")
 
 
 # ============================================================
-# PADROES DE LIMPEZA - Rodapes/cabecalhos do PJe-TJBA
+# LIMPEZA DE TEXTO
 # ============================================================
-PATTERNS_REMOVER = [
-    re.compile(r'Este documento foi gerado pelo usu[a\xe1]rio\s+\S+\s+em\s+\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}:\d{2}', re.IGNORECASE),
-    re.compile(r'N[u\xfa]mero do documento:\s*\d+'),
-    re.compile(r'https?://pje\.tjba\.jus\.br\S*'),
-    re.compile(r'Assinado eletronicamente por:.*?(?=\n|$)'),
-    re.compile(r'Num\.\s*\d+\s*-\s*P[a\xe1]g\.\s*\d+'),
+LIXO_GLOBAL = [
+    re.compile(r'Este documento foi gerado pelo usu.rio\s+\S+.*', re.IGNORECASE | re.DOTALL),
+    re.compile(r'N.mero do documento:\s*\d+', re.IGNORECASE),
+    re.compile(r'https?://pje\.tjba\.jus\.br\S*', re.IGNORECASE),
+    re.compile(r'Assinado eletronicamente por:.*?(?=\n\n|\Z)', re.IGNORECASE | re.DOTALL),
+    re.compile(r'Num\.\s*\d+\s*-\s*P.g\.\s*\d+', re.IGNORECASE),
+    re.compile(r'PODER JUDICI.RIO[\s\n]+TRIBUNAL DE JUSTI.A DO ESTADO DA BAHIA[\s\n]*', re.IGNORECASE),
+    re.compile(r'\(documento gerado e assinado automaticamente pelo PJe\)', re.IGNORECASE),
+    re.compile(r'Autos n[°º]\s*[\d.\-/]+\s*\n?', re.IGNORECASE),
 ]
 
-PATTERNS_SEPARADOR = re.compile(r'^[\s\-_=]{3,}$', re.MULTILINE)
+CABECALHO_PECA = [
+    re.compile(r'Processo:\s*[\d.\-/]+.*?\n', re.IGNORECASE),
+    re.compile(r'.rg.o Julgador:.*?\n', re.IGNORECASE),
+    re.compile(r'VARA CRIMINAL DE RIO REAL.*?\n', re.IGNORECASE),
+    re.compile(r'Classe:\s*.+?\n', re.IGNORECASE),
+]
 
-
-def extrair_numero_processo(nome_arquivo):
-    match = re.search(r'(\d{7}[-.]?\d{2})[_.](\d{4})[_.](\d{1,2})[_.](\d{2})[_.](\d{4})', nome_arquivo)
-    if match:
-        p1 = match.group(1)
-        if '-' not in p1 and '.' not in p1:
-            p1 = p1[:7] + '-' + p1[7:]
-        return f"{p1}.{match.group(2)}.{match.group(3)}.{match.group(4)}.{match.group(5)}"
-    return Path(nome_arquivo).stem
-
-
-def limpar_texto(texto):
+def limpar(texto: str, profundo: bool = False) -> str:
     if not texto:
         return ""
-    for pattern in PATTERNS_REMOVER:
-        texto = pattern.sub('', texto)
-    texto = PATTERNS_SEPARADOR.sub('', texto)
-    texto = re.sub(r'\n{3,}', '\n\n', texto)
+    for p in LIXO_GLOBAL:
+        texto = p.sub('', texto)
+    if profundo:
+        for p in CABECALHO_PECA:
+            texto = p.sub('', texto)
+    # Normalizar espaços em branco
+    texto = re.sub(r'\r\n', '\n', texto)
+    texto = re.sub(r'[ \t]+\n', '\n', texto)
+    texto = re.sub(r'\n{4,}', '\n\n\n', texto)
     linhas = [l.rstrip() for l in texto.split('\n')]
     return '\n'.join(linhas).strip()
 
 
-def detectar_tipo_documento(texto):
-    if not texto:
-        return "VAZIO"
-    t = texto.lower()
-    tipos = [
-        ("DENUNCIA", ["oferece a presente den", "denuncia como incurso", "denncia"]),
-        ("SENTENCA", ["sentena", "vistos, etc", "julgo procedente", "julgo improcedente", "condeno o", "absolvo o"]),
-        ("DECISAO", ["deciso interlocutria", "decido que", "defiro o pedido", "indefiro o pedido"]),
-        ("DESPACHO", ["despacho", "cite-se", "intime-se", "cumpra-se", "designe-se"]),
-        ("ATA DE AUDIENCIA", ["ata de audincia", "ata de audiencia", "aberta a audincia", "aberta a audiencia"]),
-        ("CERTIDAO", ["certifico que", "certido"]),
-        ("INTIMACAO", ["intimao", "intimacao", "fica intimado", "ficam intimados"]),
-        ("ALVARA", ["alvar de soltura", "alvara"]),
-        ("MANDADO", ["mandado de"]),
-        ("OFICIO", ["ofcio", "oficio", "sirvo-me deste"]),
-        ("PETICAO", ["petio", "peticao"]),
-        ("RESPOSTA A ACUSACAO", ["resposta  acusao", "resposta a acusacao", "defesa prvia", "defesa previa"]),
-        ("ALEGACOES FINAIS", ["alegaes finais", "alegacoes finais", "memoriais"]),
-        ("PRONUNCIA", ["pronuncio", "pronncia", "pronuncia"]),
-        ("RECURSO", ["apelao", "apelacao", "recurso", "contrarrazes", "contrarrazoes"]),
-        ("LAUDO", ["laudo", "percia", "pericia", "perito"]),
-    ]
-    for tipo, keywords in tipos:
-        if any(kw in t for kw in keywords):
-            return tipo
-    return "OUTRO"
+# ============================================================
+# DETECÇÃO DE SCAN — 5 HEURÍSTICAS
+# ============================================================
+def detectar_scan(page, texto_limpo: str) -> tuple[bool, str]:
+    """
+    Retorna (é_scan: bool, razão: str)
+    Usa múltiplas heurísticas para máxima cobertura.
+    """
+    area_pt2 = (page.width or 595) * (page.height or 842)
+    chars = len(texto_limpo.replace(' ', '').replace('\n', ''))
 
+    # ── Heurística 1: densidade de caracteres por área ──────────────
+    densidade = chars / area_pt2 if area_pt2 > 0 else 0
+    if chars < MIN_CHARS_PAGINA and densidade < SCAN_CHARS_POR_AREA:
+        # Pode ser vazia ou scan — checar imagens antes de decidir
+        pass
 
-def extrair_com_pdfplumber(pdf_path, progresso=None):
-    import pdfplumber
-    paginas = []
-    with pdfplumber.open(pdf_path) as pdf:
-        total = len(pdf.pages)
-        for i, page in enumerate(pdf.pages):
-            pag_num = i + 1
-            try:
-                texto = page.extract_text() or ""
-            except Exception:
-                texto = ""
+    # ── Heurística 2: imagens grandes via pdfplumber ─────────────────
+    imagens = getattr(page, 'images', []) or []
+    for img in imagens:
+        # pdfplumber retorna coordenadas em pontos
+        w = abs((img.get('x1', 0) or 0) - (img.get('x0', 0) or 0))
+        h = abs((img.get('bottom', 0) or 0) - (img.get('top', 0) or 0))
+        area_img = w * h
+        if area_img > 0 and area_pt2 > 0:
+            frac = area_img / area_pt2
+            if frac > SCAN_IMG_MIN_FRAC:
+                return True, f"imagem_grande({frac:.0%}_da_pagina)"
 
-            texto_limpo = limpar_texto(texto)
-            tem_texto = len(texto_limpo) >= MIN_CHARS_TEXTO
+    # ── Heurística 3: texto fragmentado (OCR ruim ou nenhum) ─────────
+    if texto_limpo:
+        linhas = [l for l in texto_limpo.split('\n') if l.strip()]
+        if len(linhas) >= 5:
+            curtas = sum(1 for l in linhas if len(l.strip()) < 5)
+            frac_curtas = curtas / len(linhas)
+            if frac_curtas > SCAN_LINHAS_CURTAS_FRAC:
+                return True, f"linhas_fragmentadas({frac_curtas:.0%})"
 
-            if progresso:
-                if tem_texto:
-                    progresso.pagina(pag_num, "txt")
-                else:
-                    progresso.pagina(pag_num, "vazia")
-
-            paginas.append((pag_num, texto))
-    return paginas
-
-
-def extrair_com_pypdf(pdf_path, progresso=None):
-    from pypdf import PdfReader
-    paginas = []
-    reader = PdfReader(pdf_path)
-    total = len(reader.pages)
-    for i, page in enumerate(reader.pages):
-        pag_num = i + 1
+    # ── Heurística 4: pouco texto + sem imagens detectadas ───────────
+    # Alguns PDFs escaneados não expõem imagens via API mas têm pouco texto
+    if chars < MIN_CHARS_PAGINA:
+        # Tentar detectar via objetos da página
         try:
-            texto = page.extract_text() or ""
+            # Acessa o dicionário interno do pdfplumber
+            objs = getattr(page, 'objects', {})
+            tem_obj_grafico = bool(
+                objs.get('rect', []) or
+                objs.get('curve', []) or
+                objs.get('image', [])
+            )
+            if tem_obj_grafico:
+                return True, "objetos_graficos_sem_texto"
         except Exception:
-            texto = ""
+            pass
 
-        if progresso:
-            progresso.pagina(pag_num, "txt" if texto.strip() else "vazia")
+        # Se não tem nada → pode ser página em branco mesmo
+        # Distinguir: scan tem alguns chars OCR fragments, vazia tem zero
+        if chars == 0:
+            return False, "vazia"
+        else:
+            return True, f"poucos_chars({chars})"
 
-        paginas.append((pag_num, texto))
-    return paginas
+    # ── Heurística 5: proporção texto/área muito baixa ───────────────
+    # Para páginas que TÊM algum texto mas é suspeito
+    if densidade < SCAN_CHARS_POR_AREA * 2 and chars < MIN_CHARS_PAGINA * 3:
+        if imagens:  # só confirma se houver alguma imagem
+            return True, f"baixa_densidade({densidade:.4f})"
+
+    return False, "texto_normal"
 
 
-def tentar_ocr_pagina(pdf_path, pag_num):
-    # Metodo 1: PyMuPDF (fitz)
+def detectar_scan_fitz(pdf_path: str, pag_num: int) -> tuple[bool, str]:
+    """
+    Heurística extra usando PyMuPDF (mais preciso para detecção de XObjects).
+    Só chamada se pdfplumber não for conclusivo.
+    """
     try:
-        import fitz
+        import fitz  # PyMuPDF
         doc = fitz.open(pdf_path)
         page = doc[pag_num - 1]
-        pix = page.get_pixmap(dpi=200)
+
+        # Verificar se a página tem imagens no XObject dictionary
+        xobjs = page.get_xobjects()
+        tem_imagem = any(x[1].startswith('/Image') or 'Image' in str(x) for x in xobjs)
+
+        # Verificar se a página renderizada tem muito branco (scan em branco)
+        if not tem_imagem:
+            # Renderizar a baixa resolução para checar
+            clip = fitz.Rect(0, 0, page.rect.width, page.rect.height)
+            mat = fitz.Matrix(0.2, 0.2)  # 20% — só para checar
+            pix = page.get_pixmap(matrix=mat, clip=clip)
+            samples = pix.samples
+            total = len(samples)
+            if total > 0:
+                brancos = sum(1 for b in samples if b > 250)
+                frac_branco = brancos / total
+                if frac_branco > 0.95:  # quase tudo branco = página vazia
+                    doc.close()
+                    return False, "pagina_branca_renderizada"
+
+        doc.close()
+        if tem_imagem:
+            return True, "xobject_imagem_fitz"
+        return False, "sem_imagem_fitz"
+    except Exception:
+        return False, "fitz_indisponivel"
+
+
+# ============================================================
+# CLASSIFICAÇÃO DE PEÇAS
+# ============================================================
+CLASSIFICADORES = [
+    ("DENUNCIA",   ["oferece a presente den", "denuncia como incurso", "denúncia como incursa",
+                    "o ministério público", "promotor de justiça"]),
+    ("SENTENCA",   ["vistos, etc", "vistos e relatados", "julgo procedente",
+                    "julgo improcedente", "condeno o réu", "condeno o r", "absolvo o r",
+                    "absolvo o réu", "dispositivo", "ante o exposto"]),
+    ("PRONUNCIA",  ["pronuncio o r", "pronuncia o r", "pronunciado", "pronúncia"]),
+    ("ALEGACOES",  ["alegações finais", "alegacoes finais", "memoriais", "razões finais"]),
+    ("RESPOSTA",   ["resposta à acusação", "resposta a acusação", "defesa prévia",
+                    "defesa previa", "resposta da defesa"]),
+    ("RECURSO",    ["apelação", "apelacao", "razões recursais", "contrarrazões",
+                    "contrarrazoes", "recurso em sentido"]),
+    ("LAUDO",      ["laudo pericial", "laudo de exame", "exame de corpo de delito",
+                    "perito", "quesitos", "laudo toxicológico"]),
+    ("DECISAO",    ["decido que", "defiro o pedido", "indefiro o pedido",
+                    "despacho decisório", "decido", "decisão interlocutória"]),
+    ("DESPACHO",   ["despacho", "cite-se", "intime-se", "cumpra-se", "designe-se",
+                    "vista ao ministério", "vista à defesa", "conclusos"]),
+    ("ATA",        ["ata de audiência", "ata de audiencia", "aberta a audiência",
+                    "termo de audiência", "iniciada a audiência"]),
+    ("CERTIDAO",   ["certifico que", "certidão", "certifico e dou fé"]),
+    ("INTIMACAO",  ["intimação", "fica intimado", "ficam intimados", "intimo"]),
+    ("OFICIO",     ["ofício n", "oficio n", "sirvo-me do presente"]),
+    ("MANDADO",    ["mandado de", "em cumprimento ao mandado"]),
+    ("ALVARA",     ["alvará de soltura", "alvarará"]),
+    ("PETICAO",    ["petição", "peticao", "requer a vossa excelência"]),
+]
+
+def classificar_peca(texto: str) -> str | None:
+    if not texto:
+        return None
+    t = texto.lower()[:2000]  # só os primeiros 2000 chars
+    for tipo, kws in CLASSIFICADORES:
+        if any(kw in t for kw in kws):
+            return tipo
+    return "DOC"
+
+
+# ============================================================
+# OCR
+# ============================================================
+def tentar_ocr(pdf_path: str, pag_num: int, ocr_engine: str) -> str:
+    """Tenta OCR em ordem de qualidade: fitz → pdf2image → pypdf+PIL"""
+
+    # Motor 1: PyMuPDF (melhor qualidade de renderização)
+    if ocr_engine in ("fitz", "auto"):
+        try:
+            import fitz
+            import pytesseract
+            from PIL import Image
+            import io
+            doc = fitz.open(pdf_path)
+            page = doc[pag_num - 1]
+            pix = page.get_pixmap(dpi=250)
+            img = Image.open(io.BytesIO(pix.tobytes("png")))
+            doc.close()
+            texto = pytesseract.image_to_string(img, lang='por',
+                config='--psm 1 --oem 3')
+            return texto.strip()
+        except ImportError:
+            pass
+        except Exception:
+            pass
+
+    # Motor 2: pdf2image + Tesseract
+    if ocr_engine in ("pdf2image", "auto"):
+        try:
+            from pdf2image import convert_from_path
+            import pytesseract
+            images = convert_from_path(pdf_path, first_page=pag_num,
+                                       last_page=pag_num, dpi=250)
+            if images:
+                texto = pytesseract.image_to_string(images[0], lang='por',
+                    config='--psm 1 --oem 3')
+                return texto.strip()
+        except ImportError:
+            pass
+        except Exception:
+            pass
+
+    # Motor 3: pypdf → PIL (fallback)
+    try:
+        from pypdf import PdfReader
+        import pytesseract
         from PIL import Image
         import io
-        img = Image.open(io.BytesIO(pix.tobytes("png")))
-        doc.close()
-        import pytesseract
-        texto = pytesseract.image_to_string(img, lang='por')
-        return texto.strip()
-    except ImportError:
-        pass
-    except Exception:
-        pass
-
-    # Metodo 2: pdf2image
-    try:
-        from pdf2image import convert_from_path
-        images = convert_from_path(pdf_path, first_page=pag_num, last_page=pag_num, dpi=200)
-        if images:
-            import pytesseract
-            texto = pytesseract.image_to_string(images[0], lang='por')
-            return texto.strip()
-    except ImportError:
-        pass
+        reader = PdfReader(pdf_path)
+        page = reader.pages[pag_num - 1]
+        for img_obj in page.images:
+            img = Image.open(io.BytesIO(img_obj.data))
+            if img.width > 300 and img.height > 300:
+                texto = pytesseract.image_to_string(img, lang='por',
+                    config='--psm 1 --oem 3')
+                if texto.strip():
+                    return texto.strip()
     except Exception:
         pass
 
     return ""
 
 
-def obter_metadados_pdf(pdf_path):
+# ============================================================
+# UTILITÁRIOS
+# ============================================================
+def extrair_numero(nome: str) -> str:
+    m = re.search(r'(\d{7}[-.]?\d{2})[_.](\d{4})[_.](\d{1,2})[_.](\d{2})[_.](\d{4})', nome)
+    if m:
+        p1 = m.group(1)
+        if '-' not in p1 and '.' not in p1:
+            p1 = p1[:7] + '-' + p1[7:]
+        return f"{p1}.{m.group(2)}.{m.group(3)}.{m.group(4)}.{m.group(5)}"
+    return Path(nome).stem
+
+def obter_metadados(pdf_path: str) -> dict:
     try:
         from pypdf import PdfReader
-        reader = PdfReader(pdf_path)
-        meta = reader.metadata or {}
+        r = PdfReader(pdf_path)
+        m = r.metadata or {}
         return {
-            "titulo": str(meta.get("/Title", "") or ""),
-            "assunto": str(meta.get("/Subject", "") or ""),
-            "keywords": str(meta.get("/Keywords", "") or ""),
-            "paginas": len(reader.pages),
+            "titulo":  str(m.get("/Title",   "") or ""),
+            "assunto": str(m.get("/Subject", "") or ""),
+            "paginas": len(r.pages),
         }
     except Exception:
-        return {"titulo": "", "assunto": "", "keywords": "", "paginas": 0}
+        return {"titulo": "", "assunto": "", "paginas": 0}
+
+def extrair_data(texto: str) -> str:
+    m = re.search(r'(\d{2}/\d{2}/\d{4})', texto)
+    return m.group(1) if m else ""
+
+def primeira_linha(texto: str, max_chars: int = 120) -> str:
+    for linha in texto.split('\n'):
+        linha = linha.strip()
+        if len(linha) > 10:
+            return linha[:max_chars]
+    return texto[:max_chars]
 
 
-def processar_e_salvar(pdf_path, progresso=None, ocr_disponivel=False):
-    nome_arquivo = os.path.basename(pdf_path)
-    numero = extrair_numero_processo(nome_arquivo)
+# ============================================================
+# PROCESSAMENTO PRINCIPAL
+# ============================================================
+def processar_pdf(pdf_path: str, progresso: Progresso | None = None,
+                  ocr_disponivel: bool = False) -> dict:
+    import pdfplumber
 
-    # Metadados
-    meta = obter_metadados_pdf(pdf_path)
-    total_paginas = meta["paginas"]
+    nome    = os.path.basename(pdf_path)
+    numero  = extrair_numero(nome)
+    meta    = obter_metadados(pdf_path)
+    n_pags  = meta["paginas"]
 
-    if total_paginas == 0:
-        return {
-            "numero": numero, "arquivo": nome_arquivo,
-            "status": "ERRO", "erro": "Sem paginas ou PDF corrompido"
-        }
+    if n_pags == 0:
+        return {"numero": numero, "arquivo": nome, "status": "ERRO",
+                "erro": "PDF sem páginas ou corrompido"}
 
     if progresso:
-        progresso.novo_pdf(progresso.pdf_atual, nome_arquivo, total_paginas)
+        progresso.novo_pdf(progresso.atual, nome, n_pags)
 
-    # Extrair texto
-    paginas_raw = []
-    try:
-        paginas_raw = extrair_com_pdfplumber(pdf_path, progresso)
-    except Exception as e1:
-        print(f"\n    pdfplumber falhou, tentando pypdf... ({e1})")
+    # ── Determinar motor de OCR disponível ──────────────────────────
+    ocr_motor = "nenhum"
+    if ocr_disponivel:
         try:
-            paginas_raw = extrair_com_pypdf(pdf_path, progresso)
-        except Exception as e2:
-            return {
-                "numero": numero, "arquivo": nome_arquivo,
-                "status": "ERRO", "erro": f"Ambas bibliotecas falharam: {e1} / {e2}"
-            }
+            import fitz
+            ocr_motor = "fitz"
+        except ImportError:
+            try:
+                import pdf2image
+                ocr_motor = "pdf2image"
+            except ImportError:
+                ocr_motor = "pypdf"
 
-    # Processar cada pagina
-    stats = {"texto": 0, "ocr": 0, "vazias": 0, "documentos": []}
-    conteudo_paginas = []
-    doc_atual = None
+    stats = {"texto": 0, "ocr": 0, "scan": 0, "vazias": 0, "ocr_fail": 0}
+    paginas_proc = []  # [(n, texto, tipo_peca, eh_scan, razao_scan)]
 
-    for pag_num, texto_bruto in paginas_raw:
-        texto_util = limpar_texto(texto_bruto)
+    try:
+        pdf = pdfplumber.open(pdf_path)
+    except Exception as e:
+        return {"numero": numero, "arquivo": nome, "status": "ERRO", "erro": str(e)}
 
-        if len(texto_util) >= MIN_CHARS_TEXTO:
-            stats["texto"] += 1
-            texto_final = texto_util
-        else:
-            if ocr_disponivel:
-                try:
-                    texto_ocr = tentar_ocr_pagina(pdf_path, pag_num)
-                    texto_ocr_limpo = limpar_texto(texto_ocr)
-                    if len(texto_ocr_limpo) >= MIN_CHARS_TEXTO:
-                        stats["ocr"] += 1
-                        texto_final = texto_ocr_limpo
-                        if progresso:
-                            progresso.pagina(pag_num, "ocr")
-                    else:
-                        stats["vazias"] += 1
-                        texto_final = ""
-                except Exception:
-                    stats["vazias"] += 1
-                    texto_final = ""
-            else:
+    for i, page in enumerate(pdf.pages):
+        n = i + 1
+        try:
+            texto_bruto = page.extract_text() or ""
+        except Exception:
+            texto_bruto = ""
+
+        texto = limpar(texto_bruto)
+        eh_scan, razao = detectar_scan(page, texto)
+
+        # ── Confirmar scan via fitz se disponível e caso ambíguo ────
+        if not eh_scan and len(texto) < MIN_CHARS_PAGINA * 2:
+            try:
+                import fitz
+                eh_scan_fitz, razao_fitz = detectar_scan_fitz(pdf_path, n)
+                if eh_scan_fitz:
+                    eh_scan, razao = True, razao_fitz
+            except ImportError:
+                pass
+
+        if eh_scan:
+            if razao == "vazia":
                 stats["vazias"] += 1
+                tipo_prog = "vazia"
                 texto_final = ""
-
-        tipo_doc = detectar_tipo_documento(texto_final) if texto_final else "VAZIO"
-
-        if tipo_doc not in ("OUTRO", "VAZIO"):
-            if doc_atual and doc_atual["tipo"] == tipo_doc:
-                doc_atual["pag_fim"] = pag_num
+                tipo_peca = None
+            elif ocr_disponivel:
+                texto_ocr = tentar_ocr(pdf_path, n, ocr_motor)
+                texto_ocr_limpo = limpar(texto_ocr)
+                if len(texto_ocr_limpo) >= MIN_CHARS_PAGINA:
+                    stats["ocr"] += 1
+                    tipo_prog = "ocr"
+                    texto_final = texto_ocr_limpo
+                    tipo_peca = classificar_peca(texto_ocr_limpo)
+                else:
+                    stats["ocr_fail"] += 1
+                    stats["scan"] += 1
+                    tipo_prog = "ocr_fail"
+                    texto_final = ""
+                    tipo_peca = None
             else:
-                if doc_atual:
-                    stats["documentos"].append(doc_atual)
-                doc_atual = {"tipo": tipo_doc, "pag_inicio": pag_num, "pag_fim": pag_num}
+                stats["scan"] += 1
+                tipo_prog = "scan"
+                texto_final = ""
+                tipo_peca = None
 
-        conteudo_paginas.append((pag_num, texto_final, tipo_doc))
+            paginas_proc.append((n, texto_final, tipo_peca, True, razao))
 
-    if doc_atual:
-        stats["documentos"].append(doc_atual)
+        elif len(texto) >= MIN_CHARS_PAGINA:
+            stats["texto"] += 1
+            tipo_prog = "txt"
+            tipo_peca = classificar_peca(texto)
+            paginas_proc.append((n, texto, tipo_peca, False, ""))
+        else:
+            stats["vazias"] += 1
+            tipo_prog = "vazia"
+            paginas_proc.append((n, "", None, False, "vazia"))
 
-    # ============================================================
-    # MONTAR ARQUIVO DE SAIDA
-    # ============================================================
-    saida = []
-    saida.append("=" * 80)
-    saida.append(f"PROCESSO: {numero}")
-    saida.append(f"ARQUIVO: {nome_arquivo}")
-    saida.append(f"TOTAL DE PAGINAS: {total_paginas}")
-    if meta["titulo"]:
-        saida.append(f"TITULO: {meta['titulo']}")
-    if meta["assunto"]:
-        saida.append(f"PARTES: {meta['assunto']}")
-    saida.append(f"PAGINAS COM TEXTO: {stats['texto']} | OCR: {stats['ocr']} | VAZIAS: {stats['vazias']}")
-    if not ocr_disponivel and stats["vazias"] > 0:
-        saida.append(f"AVISO: Tesseract nao disponivel. {stats['vazias']} paginas sem texto nao puderam ser processadas por OCR.")
-    saida.append("=" * 80)
+        if progresso:
+            progresso.pagina(n, n_pags, tipo_prog)
 
-    if stats["documentos"]:
-        saida.append("")
-        saida.append("INDICE DE PECAS PROCESSUAIS DETECTADAS:")
-        saida.append("-" * 50)
-        for doc in stats["documentos"]:
-            if doc["pag_inicio"] == doc["pag_fim"]:
-                saida.append(f"  - {doc['tipo']} -- pag. {doc['pag_inicio']}")
-            else:
-                saida.append(f"  - {doc['tipo']} -- pags. {doc['pag_inicio']}-{doc['pag_fim']}")
-        saida.append("-" * 50)
+    pdf.close()
 
-    saida.append("")
-    for pag, texto, tipo in conteudo_paginas:
-        if not texto:
+    # ── Agrupar páginas consecutivas do mesmo tipo de peça ──────────
+    atos = []  # [{"tipo", "pag_ini", "pag_fim", "textos": [], "scan": bool, "razao": str}]
+    atual = None
+
+    for n, texto, tipo, eh_scan, razao in paginas_proc:
+        if not tipo:
+            if atual:
+                atos.append(atual)
+                atual = None
+            if eh_scan and razao != "vazia":
+                atos.append({"tipo": "SCAN", "pag_ini": n, "pag_fim": n,
+                             "textos": [], "scan": True, "razao": razao})
             continue
-        marcador = f" [{tipo}]" if tipo not in ("OUTRO", "VAZIO") else ""
-        saida.append(f"--- [PAG. {pag}]{marcador} ---")
-        saida.append(texto)
-        saida.append("")
 
-    texto_final_str = '\n'.join(saida)
+        if atual and atual["tipo"] == tipo and not eh_scan:
+            atual["pag_fim"] = n
+            atual["textos"].append(texto)
+        else:
+            if atual:
+                atos.append(atual)
+            atual = {"tipo": tipo, "pag_ini": n, "pag_fim": n,
+                    "textos": [texto] if texto else [], "scan": eh_scan, "razao": razao}
 
-    nome_saida = numero.replace('.', '_').replace('-', '_') + ".txt"
-    caminho_saida = DIR_SAIDA / nome_saida
+    if atual:
+        atos.append(atual)
 
-    with open(caminho_saida, 'w', encoding='utf-8') as f:
-        f.write(texto_final_str)
+    # ── GERAR SAÍDA MARKDOWN ESTRUTURADO ────────────────────────────
+    md = gerar_markdown(numero, nome, meta, n_pags, stats, atos, ocr_disponivel)
 
-    chars_total = len(texto_final_str)
+    nome_saida = numero.replace('.', '_').replace('-', '_') + ".md"
+    with open(DIR_SAIDA / nome_saida, 'w', encoding='utf-8') as f:
+        f.write(md)
+
+    chars_total = len(md)
     tokens_aprox = chars_total // 4
 
     resultado = {
-        "numero": numero,
-        "arquivo": nome_arquivo,
-        "arquivo_saida": nome_saida,
-        "total_paginas": total_paginas,
-        "paginas_texto": stats["texto"],
-        "paginas_ocr": stats["ocr"],
-        "paginas_vazias": stats["vazias"],
-        "documentos_detectados": len(stats["documentos"]),
-        "chars": chars_total,
-        "tokens_aprox": tokens_aprox,
+        "numero": numero, "arquivo": nome, "arquivo_saida": nome_saida,
+        "total_paginas": n_pags,
+        "pags_texto": stats["texto"], "pags_ocr": stats["ocr"],
+        "pags_scan": stats["scan"], "pags_vazias": stats["vazias"],
+        "ocr_falhas": stats["ocr_fail"],
+        "documentos_detectados": len([a for a in atos if not a["scan"]]),
+        "chars": chars_total, "tokens_aprox": tokens_aprox,
+        "ocr_disponivel": ocr_disponivel,
         "status": "OK"
     }
 
     if progresso:
-        progresso.pdf_concluido(resultado)
+        progresso.concluido(resultado)
 
     return resultado
 
 
+# ============================================================
+# GERADOR DE MARKDOWN
+# ============================================================
+def gerar_markdown(numero: str, nome: str, meta: dict, n_pags: int,
+                   stats: dict, atos: list, ocr_disponivel: bool) -> str:
+    partes = []
+
+    # ── FRONTMATTER YAML ─────────────────────────────────────────────
+    partes.append("---")
+    partes.append(f"numero: \"{numero}\"")
+    partes.append(f"arquivo: \"{nome}\"")
+    partes.append(f"total_paginas: {n_pags}")
+    if meta.get("titulo"):
+        titulo_esc = meta["titulo"].replace('"', '\\"')
+        partes.append(f"titulo: \"{titulo_esc}\"")
+    if meta.get("assunto"):
+        assunto_esc = meta["assunto"].replace('"', '\\"')
+        partes.append(f"partes: \"{assunto_esc}\"")
+    partes.append(f"paginas_texto: {stats['texto']}")
+    partes.append(f"paginas_ocr: {stats['ocr']}")
+    partes.append(f"paginas_scan_sem_ocr: {stats['scan']}")
+    partes.append(f"paginas_vazias: {stats['vazias']}")
+    partes.append(f"gerado_em: \"{datetime.now().strftime('%Y-%m-%d %H:%M')}\"")
+    if stats["scan"] > 0 and not ocr_disponivel:
+        partes.append("aviso: \"ATENÇÃO: páginas escaneadas sem OCR — instale Tesseract para recuperar texto\"")
+    partes.append("---")
+    partes.append("")
+
+    # ── CABEÇALHO ────────────────────────────────────────────────────
+    partes.append(f"# Processo {numero}")
+    partes.append("")
+    if meta.get("assunto"):
+        partes.append(f"**Partes:** {meta['assunto']}")
+        partes.append("")
+
+    # ── ÍNDICE DE PEÇAS ──────────────────────────────────────────────
+    partes.append("## Índice de Peças Processuais")
+    partes.append("")
+    partes.append("| # | Tipo | Páginas | Resumo |")
+    partes.append("|---|------|---------|--------|")
+
+    atos_indexados = [a for a in atos if not (not a["scan"] and not a["textos"])]
+    for i, ato in enumerate(atos_indexados, 1):
+        pags = (f"p.{ato['pag_ini']}" if ato['pag_ini'] == ato['pag_fim']
+                else f"p.{ato['pag_ini']}–{ato['pag_fim']}")
+        if ato["scan"]:
+            resumo = f"_Página escaneada [{ato['razao']}]_"
+        elif ato["textos"]:
+            resumo = primeira_linha(ato["textos"][0], 80)
+            resumo = resumo.replace("|", "\\|")
+        else:
+            resumo = "_sem texto_"
+        partes.append(f"| {i} | **{ato['tipo']}** | {pags} | {resumo} |")
+
+    partes.append("")
+
+    # ── CRONOLOGIA COMPACTA ──────────────────────────────────────────
+    partes.append("## Cronologia dos Atos")
+    partes.append("")
+    partes.append("```")
+    for ato in atos_indexados:
+        pags = (f"p.{ato['pag_ini']:>4}" if ato['pag_ini'] == ato['pag_fim']
+                else f"p.{ato['pag_ini']:>3}–{ato['pag_fim']:<3}")
+        if ato["scan"]:
+            partes.append(f"{pags} | {'SCAN':>12} | [imagem escaneada — {ato['razao']}]")
+        elif ato["textos"]:
+            data  = extrair_data(ato["textos"][0])
+            linha = primeira_linha(ato["textos"][0], 100)
+            partes.append(f"{pags} | {ato['tipo']:>12} | {data:>10} | {linha}")
+        else:
+            partes.append(f"{pags} | {ato['tipo']:>12} | (sem texto extraído)")
+    partes.append("```")
+    partes.append("")
+
+    # ── CONTEÚDO DAS PEÇAS ──────────────────────────────────────────
+    partes.append("## Conteúdo das Peças")
+    partes.append("")
+
+    for ato in atos_indexados:
+        pags = (f"p. {ato['pag_ini']}" if ato['pag_ini'] == ato['pag_fim']
+                else f"p. {ato['pag_ini']}–{ato['pag_fim']}")
+
+        if ato["scan"]:
+            partes.append(f"### 🖼 SCAN — {pags}")
+            partes.append("")
+            partes.append(f"> ⚠️ Página(s) escaneada(s). Razão: `{ato['razao']}`.")
+            if not ocr_disponivel:
+                partes.append("> OCR não disponível. Instale Tesseract para recuperar o texto.")
+            partes.append("")
+            continue
+
+        if not ato["textos"]:
+            continue
+
+        texto_completo = limpar('\n\n'.join(ato["textos"]), profundo=True)
+
+        if ato["tipo"] in PECAS_COMPLETAS:
+            # Conteúdo COMPLETO
+            partes.append(f"### {ato['tipo']} — {pags}")
+            partes.append("")
+            partes.append(texto_completo)
+            partes.append("")
+
+        elif ato["tipo"] in PECAS_RESUMO:
+            # Resumo (primeiras 5 linhas)
+            linhas = texto_completo.split('\n')
+            resumo = '\n'.join(l for l in linhas[:5] if l.strip())
+            if resumo:
+                partes.append(f"### {ato['tipo']} — {pags}")
+                partes.append("")
+                partes.append(f"> {resumo.replace(chr(10), chr(10) + '> ')}")
+                partes.append("")
+
+        else:
+            # DOC genérico — resumo curto
+            linhas = texto_completo.split('\n')
+            resumo = '\n'.join(l for l in linhas[:3] if l.strip())
+            if resumo:
+                partes.append(f"### DOC — {pags}")
+                partes.append("")
+                partes.append(f"> {resumo.replace(chr(10), chr(10) + '> ')}")
+                partes.append("")
+
+    return '\n'.join(partes)
+
+
+# ============================================================
+# MAIN
+# ============================================================
 def main():
     print()
-    print("=" * 60)
-    print("  EXTRACAO DE PROCESSOS JUDICIAIS - PJe/TJBA")
-    print("=" * 60)
-
-    # Verificar dependencias
+    print("=" * 62)
+    print("  EXTRAÇÃO DE PROCESSOS JUDICIAIS — PJe/TJBA  v2")
+    print("  Detecção robusta de scan + saída Markdown estruturada")
+    print("=" * 62)
     print()
-    print("  Verificando dependencias...")
+
+    # ── Verificar dependências ───────────────────────────────────────
+    print("  Dependências:")
     deps_ok = True
 
     try:
         import pdfplumber
         print("  [OK] pdfplumber")
     except ImportError:
-        print("  [XX] pdfplumber nao encontrado. Rode: pip install pdfplumber")
+        print("  [XX] pdfplumber — rode: pip install pdfplumber")
         deps_ok = False
 
     try:
         from pypdf import PdfReader
         print("  [OK] pypdf")
     except ImportError:
-        print("  [XX] pypdf nao encontrado. Rode: pip install pypdf")
+        print("  [XX] pypdf — rode: pip install pypdf")
         deps_ok = False
 
-    ocr_ok = False
+    ocr_disponivel = False
     try:
         import pytesseract
         pytesseract.get_tesseract_version()
-        print("  [OK] pytesseract + Tesseract OCR")
-        ocr_ok = True
+        print("  [OK] pytesseract + Tesseract (OCR ativo)")
+        ocr_disponivel = True
     except ImportError:
-        print("  [!!] pytesseract nao instalado (OCR indisponivel)")
-        print("       Rode: pip install pytesseract")
+        print("  [!!] pytesseract não instalado — OCR desabilitado")
     except Exception:
-        print("  [!!] Tesseract OCR nao encontrado no sistema (OCR indisponivel)")
-        print("       Paginas escaneadas serao ignoradas.")
+        print("  [!!] Tesseract não encontrado — OCR desabilitado")
+        print("       Ubuntu: sudo apt install tesseract-ocr tesseract-ocr-por")
+
+    try:
+        import fitz
+        print("  [OK] PyMuPDF (detecção de scan aprimorada)")
+    except ImportError:
+        print("  [!!] PyMuPDF ausente (detecção de scan básica)")
+        print("       Instale: pip install PyMuPDF  [recomendado]")
 
     if not deps_ok:
-        print()
-        print("  [ERRO] Dependencias obrigatorias faltando.")
+        print("\n  [ERRO] Dependências obrigatórias faltando.")
         sys.exit(1)
 
-    # Verificar pasta PDFs
+    if not ocr_disponivel:
+        print("\n  ⚠️  OCR desabilitado. Páginas escaneadas serão marcadas como SCAN.")
+        print("     Para habilitar: pip install pytesseract")
+        print("     + sudo apt install tesseract-ocr tesseract-ocr-por")
+
+    # ── Localizar PDFs ───────────────────────────────────────────────
     if not DIR_PDFS.exists():
-        print(f"\n  [ERRO] Pasta '{DIR_PDFS}' nao encontrada!")
+        print(f"\n  [ERRO] Pasta '{DIR_PDFS}' não encontrada.")
         sys.exit(1)
 
     pdfs = sorted(DIR_PDFS.glob("*.pdf"))
     if not pdfs:
-        print(f"\n  [ERRO] Nenhum PDF encontrado em '{DIR_PDFS}/'")
+        print(f"\n  [ERRO] Nenhum PDF em '{DIR_PDFS}/'")
         sys.exit(1)
 
-    total_pdfs = len(pdfs)
-    print(f"\n  {total_pdfs} PDFs encontrados")
-    if not ocr_ok:
-        print("  [!!] OCR indisponivel. Paginas sem texto serao marcadas como vazias.")
-
+    total = len(pdfs)
+    print(f"\n  {total} PDFs encontrados")
+    print(f"  Saída: {DIR_SAIDA}/ (formato .md)")
     print()
-    print("  Legenda do progresso:")
-    print("    # = pagina com texto   O = pagina com OCR   . = pagina vazia")
-    print()
-    print("  --------------------------------------------------------")
+    print("  Legenda: # texto  O OCR  S scan-sem-OCR  X OCR-falhou  . vazia")
+    print("  " + "─" * 58)
 
-    # Carregar CSV
-    dados_csv = {}
-    csv_path = Path(CSV_PROCESSOS)
-    if csv_path.exists():
-        with open(csv_path, 'r', encoding='utf-8-sig') as f:
-            for row in csv.DictReader(f):
-                num = row.get('Numero do Processo', row.get('\u004e\u00famero do Processo', '')).strip()
-                if num:
-                    dados_csv[num] = row
-
-    # Processar
-    progresso = Progresso(total_pdfs)
+    # ── Processar ────────────────────────────────────────────────────
+    prog = Progresso(total)
     resultados = []
     total_tokens = 0
     erros = 0
 
     for i, pdf_path in enumerate(pdfs, 1):
-        progresso.pdf_atual = i
+        prog.atual = i
         try:
-            resultado = processar_e_salvar(str(pdf_path), progresso, ocr_ok)
-            resultados.append(resultado)
-            if resultado["status"] == "OK":
-                total_tokens += resultado.get("tokens_aprox", 0)
+            r = processar_pdf(str(pdf_path), prog, ocr_disponivel)
+            resultados.append(r)
+            if r["status"] == "OK":
+                total_tokens += r.get("tokens_aprox", 0)
             else:
                 erros += 1
         except Exception as e:
+            import traceback
             erros += 1
             print(f"\n  [ERRO] {pdf_path.name}: {e}")
+            if os.environ.get("DEBUG"):
+                traceback.print_exc()
             resultados.append({
-                "numero": extrair_numero_processo(pdf_path.name),
+                "numero": extrair_numero(pdf_path.name),
                 "arquivo": pdf_path.name,
-                "status": "ERRO",
-                "erro": str(e)
+                "status": "ERRO", "erro": str(e)
             })
 
-    # Mapeamento
-    mapeamento = {}
-    for r in resultados:
-        if r["status"] == "OK":
-            mapeamento[r["numero"]] = {
-                "txt": r["arquivo_saida"],
-                "paginas": r["total_paginas"],
-                "tokens": r["tokens_aprox"],
-                "docs_detectados": r["documentos_detectados"]
-            }
-
+    # ── Salvar mapeamento e relatório ────────────────────────────────
+    ok = sum(1 for r in resultados if r["status"] == "OK")
+    mapeamento = {
+        r["numero"]: {
+            "md": r["arquivo_saida"],
+            "paginas": r["total_paginas"],
+            "tokens": r["tokens_aprox"],
+            "docs": r["documentos_detectados"],
+            "scan_sem_ocr": r["pags_scan"],
+        }
+        for r in resultados if r["status"] == "OK"
+    }
     with open(MAPEAMENTO_PATH, 'w', encoding='utf-8') as f:
         json.dump(mapeamento, f, ensure_ascii=False, indent=2)
 
-    # Relatorio
-    ok_count = sum(1 for r in resultados if r["status"] == "OK")
-    relatorio = {
-        "total_pdfs": total_pdfs,
-        "sucesso": ok_count,
-        "erros": erros,
-        "total_tokens_aprox": total_tokens,
-        "processos": resultados
-    }
     with open(RELATORIO_PATH, 'w', encoding='utf-8') as f:
-        json.dump(relatorio, f, ensure_ascii=False, indent=2)
+        json.dump({
+            "versao": "v2",
+            "total_pdfs": total, "sucesso": ok, "erros": erros,
+            "total_tokens": total_tokens,
+            "ocr_disponivel": ocr_disponivel,
+            "processos": resultados
+        }, f, ensure_ascii=False, indent=2)
 
-    # Resumo final
-    tempo = progresso.resumo_tempo()
-    total_paginas_all = sum(r.get("total_paginas", 0) for r in resultados if r["status"] == "OK")
+    # ── Resumo final ──────────────────────────────────────────────────
+    total_pags  = sum(r.get("total_paginas", 0) for r in resultados if r["status"] == "OK")
+    total_scan  = sum(r.get("pags_scan", 0)     for r in resultados if r["status"] == "OK")
+    total_ocr   = sum(r.get("pags_ocr", 0)      for r in resultados if r["status"] == "OK")
+    total_vazia = sum(r.get("pags_vazias", 0)   for r in resultados if r["status"] == "OK")
 
     print()
     print()
-    print("  ========================================================")
-    print("  RESUMO DA EXTRACAO")
-    print("  ========================================================")
-    print(f"  PDFs processados:  {total_pdfs}")
-    print(f"  Sucesso:           {ok_count}")
-    print(f"  Erros:             {erros}")
-    print(f"  Total de paginas:  {total_paginas_all:,}")
-    print(f"  Tokens (aprox):    {total_tokens:,}")
-    print(f"  Tempo total:       {tempo}")
-    if total_pdfs > 0:
-        media = total_tokens // max(ok_count, 1)
-        print(f"  Media por PDF:     ~{media:,} tokens")
-    print(f"  --------------------------------------------------------")
-    print(f"  Saida:       {DIR_SAIDA}/")
-    print(f"  Mapeamento:  {MAPEAMENTO_PATH}")
-    print(f"  Relatorio:   {RELATORIO_PATH}")
-    if erros > 0:
-        print(f"\n  [!!] {erros} PDFs com erro. Veja relatorio_extracao.json")
-    print("  ========================================================")
+    print("  =" * 31)
+    print("  RESUMO DA EXTRAÇÃO v2")
+    print("  =" * 31)
+    print(f"  PDFs:            {total} total  |  {ok} OK  |  {erros} erros")
+    print(f"  Páginas total:   {total_pags:,}")
+    print(f"    Com texto:     {sum(r.get('pags_texto',0) for r in resultados if r['status']=='OK'):,}")
+    print(f"    Com OCR:       {total_ocr:,}")
+    print(f"    Scan s/ OCR:   {total_scan:,}{'  ← instale Tesseract!' if total_scan > 0 and not ocr_disponivel else ''}")
+    print(f"    Vazias:        {total_vazia:,}")
+    print(f"  Tokens (aprox):  {total_tokens:,}")
+    print(f"  Média/processo:  ~{total_tokens//max(ok,1):,} tokens")
+    print(f"  Tempo:           {prog.tempo_total()}")
+    print(f"  Formato saída:   Markdown estruturado (.md)")
+    print(f"  Diretório:       {DIR_SAIDA}/")
+    print(f"  Mapeamento:      {MAPEAMENTO_PATH}")
+    if erros:
+        print(f"\n  ⚠️  {erros} PDFs com erro — veja {RELATORIO_PATH}")
+    print("  " + "=" * 60)
     print()
 
 
