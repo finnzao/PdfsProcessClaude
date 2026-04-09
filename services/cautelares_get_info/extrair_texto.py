@@ -1,0 +1,1 @@
+#Nessa função terá a funções bases para extrair texto dos processos e transformar em um arquivo melhor mais eficiente para leitura
