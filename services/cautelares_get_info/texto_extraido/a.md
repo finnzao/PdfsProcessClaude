@@ -1,1 +1,0 @@
-# ISSO SERÁ EXTRAIDO DOS PDF´s parti  de "arquivoAnalisar" na pasta raiz

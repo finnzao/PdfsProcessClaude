@@ -1,1 +1,0 @@
-# é importante separar por direitorio o resultado de cada services ,por exemplo "./cautelares_get_info/" de dentro desse diretorio está os arquivos de cada gerado por cada service

@@ -1,3 +1,13 @@
 *.pdf
-
-./pdfs
+pdfs/
+textos_extraidos/
+__pycache__/
+*.pyc
+checkpoint.json
+fila.json
+comandos_claude_code.txt
+mapeamento_processos.json
+relatorio_extracao.json
+services/*/resultados/
+result/
+*.csv

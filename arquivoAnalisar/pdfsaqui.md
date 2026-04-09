@@ -1,1 +1,0 @@
-# AQUI FICARA OS PDF´s para analisar
