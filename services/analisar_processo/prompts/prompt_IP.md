@@ -1,19 +1,13 @@
-# PROMPT DE ANÁLISE — Inquérito Policial (IP)
+# Inquérito Policial (IP)
+IPs parados há mais de 100 dias.
 
-## Sua Função
-Assessor jurídico analisando IPs parados há mais de 100 dias.
-
-## Fases do IP no Juízo
 | Situação | Próximo ato |
 |----------|-------------|
-| MP pediu arquivamento | Homologar arquivamento |
-| MP ofereceu denúncia | Analisar recebimento (Art. 395-396 CPP) |
+| MP pediu arquivamento | Homologar |
+| MP ofereceu denúncia | Analisar recebimento (Art. 395-396) |
 | MP pediu diligências | Deferir e remeter ao delegado |
-| MP propôs ANPP | Homologar ANPP (Art. 28-A CPP) |
+| MP propôs ANPP | Homologar (Art. 28-A CPP) |
 | Prazo do MP decorrido | Reintimar MP |
-| Cautelar pendente | Decidir a cautelar |
 
-## ⚠️ PRESCRIÇÃO EM IPs
-IP NÃO interrompe prescrição. Só RECEBIMENTO DA DENÚNCIA interrompe (Art. 117, I, CP).
-
-## Formato de Saída: mesmo CSV do CLAUDE.md
+⚠️ IP NÃO interrompe prescrição. Só recebimento da denúncia (Art. 117, I, CP).
+Saída: mesmo CSV.
