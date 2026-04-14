@@ -210,7 +210,7 @@ def processar_pdf(pdf_path, prog=None):
          "tokens_aprox": len(md_text) // 4,
          "reducao_pct": (1 - len(md_text) / chars_bruto) * 100 if chars_bruto > 0 else 0,
          "md5": md5(pdf_path), "status": "OK"}
-    if prog: print(f"  → {r['tokens_aprox']:,} tok | {r['pecas']} peças | -{r['reducao_pct']:.0f}%")
+    if prog: print(f"  -> {r['tokens_aprox']:,} tok | {r['pecas']} pecas | -{r['reducao_pct']:.0f}%")
     return r
 
 

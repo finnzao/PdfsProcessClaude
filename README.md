@@ -14,3 +14,6 @@ python run.py analise consolidar
 python run.py cautelares fila
 python run.py cautelares consolidar
 ```
+
+
+python auto_analisar.py --claude-path "C:\Users\{user}\AppData\Roaming\npm\claude.cmd"

@@ -38,5 +38,5 @@ class ConsolidarBase:
         with open(saida, 'w', newline='', encoding='utf-8') as f:
             w = csv.DictWriter(f, fieldnames=headers or linhas[0].keys())
             w.writeheader(); w.writerows(linhas)
-        print(f"  ✅ {len(linhas)} registros → {saida}")
+        print(f"  OK {len(linhas)} registros -> {saida}")
         return saida

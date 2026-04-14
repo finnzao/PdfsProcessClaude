@@ -33,7 +33,7 @@ class CheckpointManager:
         for p in processos:
             ck["processos_analisados"][p] = {"comando": cmd_num, "data": agora, "arquivo": resultado_path}
         self.salvar(ck)
-        print(f"  ✅ Comando #{cmd_num:03d} | {len(processos)} processos | Total: {len(ck['processos_analisados'])}")
+        print(f"  OK Comando #{cmd_num:03d} | {len(processos)} processos | Total: {len(ck['processos_analisados'])}")
 
     def processos_ja_analisados(self):
         return set(self.carregar().get("processos_analisados", {}).keys())

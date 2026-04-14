@@ -52,9 +52,9 @@ class ConsolidarCustodiados(ConsolidarBase):
     SERVICE_NAME = "cautelares_get_info"
 
     def consolidar(self):
-        print(f"{'='*60}\n  CONSOLIDAÇÃO — Custodiados → XLSX\n{'='*60}")
+        print(f"{'='*60}\n  CONSOLIDACAO - Custodiados -> XLSX\n{'='*60}")
         jsons = sorted(self.resultados_dir.glob("custodiado_*.json"))
-        if not jsons: print("  ❌ Sem resultados."); return
+        if not jsons: print("  Sem resultados."); return
         todos = []
         for jp in jsons:
             try:
@@ -62,12 +62,12 @@ class ConsolidarCustodiados(ConsolidarBase):
                 if isinstance(d, list): todos.extend(d)
                 elif "custodiados" in d: todos.extend(d["custodiados"])
                 else: todos.append(d)
-            except Exception as e: print(f"  ⚠️ {jp.name}: {e}")
-        if not todos: print("  ❌ Vazio."); return
+            except Exception as e: print(f"  AVISO {jp.name}: {e}")
+        if not todos: print("  Vazio."); return
         print(f"  {len(todos)} custodiados")
         saida = self.result_dir / "custodiados_para_cadastro.xlsx"
         self._xlsx(todos, saida)
-        print(f"  ✅ {saida}")
+        print(f"  OK {saida}")
 
     def _xlsx(self, dados, path):
         try:

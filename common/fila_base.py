@@ -85,7 +85,7 @@ class FilaBase:
             "comandos": [{"num": c["num"], "processos": c["processos"], "tipo": c["tipo"]} for c in cmds]
         }, ensure_ascii=False, indent=2), encoding='utf-8')
 
-        print(f"\n  {cn} comandos → {self.comandos_path}")
+        print(f"\n  {cn} comandos -> {self.comandos_path}")
 
     def status(self):
         """Barra de progresso."""
@@ -97,8 +97,8 @@ class FilaBase:
             fl = json.loads(self.fila_path.read_text())
             tc, tp = fl.get("total_comandos",0), fl.get("total_processos",0)
         pct = done/tp*100 if tp else 0
-        bar = "█" * int(pct//2.5) + "░" * (40-int(pct//2.5))
+        bar = "#" * int(pct//2.5) + "-" * (40-int(pct//2.5))
         print(f"\n  [{bar}] {pct:.1f}%\n  Processos: {done}/{tp} | Comandos: {ult}/{tc}")
-        if ult < tc: print(f"  ▶ Próximo: #{ult+1:03d}")
-        elif tc: print("  ✅ COMPLETO!")
+        if ult < tc: print(f"  > Proximo: #{ult+1:03d}")
+        elif tc: print("  COMPLETO!")
         print()
