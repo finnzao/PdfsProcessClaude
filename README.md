@@ -17,3 +17,7 @@ python run.py cautelares consolidar
 
 
 python auto_analisar.py --claude-path "C:\Users\{user}\AppData\Roaming\npm\claude.cmd"
+
+
+#TO DO :
+- Manage permsion when execute the command :"Preciso da sua permissao para gravar nos arquivos de resultados. Por favor, aceite a permissao de escrita para que eu possa salvar"
