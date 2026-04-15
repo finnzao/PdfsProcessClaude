@@ -1,0 +1,19 @@
+The 4 files need permission to write. Waiting for approval to create:
+
+1. **triagem_004.json** â€” ficha de triagem com os 3 processos
+2. **8001494_03_2025_8_05_0216.md** â€” IP homicidio culposo transito (Claudiane/Lorrane)
+3. **8001090_49_2025_8_05_0216.md** â€” IP latrocinio tentado (Eduardo "Dudu") - **REU PRESO**
+4. **8001664_72_2025_8_05_0216.md** â€” IP lesao corporal / tentativa homicidio (Eugenio)
+
+**Resumo dos achados**:
+
+| Processo | Crime | Urgencia | Prescricao | Proximo Ato |
+|----------|-------|----------|-----------|-------------|
+| 8001494 | Hom. culposo transito + lesao culposa | ALTA | BAIXO (lesao 11/2027) | Vista ao MP |
+| 8001090 | Latrocinio tentado (hediondo) | **CRITICA** (reu preso 10m) | SEM RISCO | Vista ao MP c/ urgencia + revisao preventiva |
+| 8001664 | Lesao corporal / tent. homicidio | MEDIA | BAIXO | Vista ao MP (avaliar capitulacao) |
+
+**Alertas principais**:
+- **8001090**: Reu preso ha 10+ meses sem denuncia â€” risco de HC por excesso de prazo. Revisao da preventiva (Art. 316 Â§unico) nao consta nos autos.
+- **8001494**: Lesao culposa de transito (vitima Brenda) prescreve em 04/11/2027 (~1a7m).
+- **8001664**: Divergencia BO vs. delegado na capitulacao â€” MP precisa definir se e lesao ou tentativa de homicidio.
