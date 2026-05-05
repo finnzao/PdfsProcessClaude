@@ -1,0 +1,12 @@
+# Pipeline de custodiados — dependências Python
+# Instale com: pip install -r requirements.txt
+
+# Reconciliação de nomes (fuzzy matching)
+rapidfuzz>=3.0.0
+unidecode>=1.3.0
+
+# Planilhas xlsx
+openpyxl>=3.1.0
+
+# (já requerido pelo extrator de PDFs do projeto principal)
+# pymupdf4llm
