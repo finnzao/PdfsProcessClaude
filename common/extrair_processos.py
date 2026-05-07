@@ -36,9 +36,7 @@ from utils import (
 import utils as _utils_module
 
 
-# ═══════════════════════════════════════════════════════════════════
 #  Caminhos do projeto
-# ═══════════════════════════════════════════════════════════════════
 
 DIR_PDFS      = Path(__file__).parent.parent / "pdfs"
 DIR_SAIDA     = Path(__file__).parent.parent / "textos_extraidos"
@@ -59,9 +57,7 @@ _PAPEIS_MARCADORES: dict[str, list[str]] = {
 }
 
 
-# ═══════════════════════════════════════════════════════════════════
 #  Cache helpers
-# ═══════════════════════════════════════════════════════════════════
 
 def _md5_arquivo(path: str) -> str:
     h = hashlib.md5()
@@ -81,9 +77,7 @@ def _cache_key(pdf_path: str) -> str:
     return f"{_md5_arquivo(pdf_path)}_{_hash_utils()}"
 
 
-# ═══════════════════════════════════════════════════════════════════
 #  OCR fallback
-# ═══════════════════════════════════════════════════════════════════
 
 def _pagina_precisa_ocr(chunk: dict) -> bool:
     texto = chunk.get("text", "")
@@ -108,9 +102,7 @@ def _ocr_pagina(pdf_path: str, pagina_idx: int) -> str:
         return ""
 
 
-# ═══════════════════════════════════════════════════════════════════
 #  Classificador com score de confiança
-# ═══════════════════════════════════════════════════════════════════
 
 def _classificar_com_confianca(texto: str) -> tuple[str, float]:
     """
@@ -134,9 +126,7 @@ def _classificar_com_confianca(texto: str) -> tuple[str, float]:
     return tipo, confianca
 
 
-# ═══════════════════════════════════════════════════════════════════
 #  Agrupamento inteligente de páginas
-# ═══════════════════════════════════════════════════════════════════
 
 def _deve_agrupar(ultimo: dict, atual: dict) -> bool:
     """
@@ -153,9 +143,7 @@ def _deve_agrupar(ultimo: dict, atual: dict) -> bool:
     return True
 
 
-# ═══════════════════════════════════════════════════════════════════
 #  Extração de metadados da capa
-# ═══════════════════════════════════════════════════════════════════
 
 def _extrair_meta_capa(texto: str) -> dict:
     meta = {"classe": "", "assunto": ""}
@@ -168,9 +156,7 @@ def _extrair_meta_capa(texto: str) -> dict:
     return meta
 
 
-# ═══════════════════════════════════════════════════════════════════
 #  Extração de movimentação processual
-# ═══════════════════════════════════════════════════════════════════
 
 def _extrair_movimentacao(texto_capa: str) -> list[dict]:
     """
@@ -187,9 +173,7 @@ def _extrair_movimentacao(texto_capa: str) -> list[dict]:
     ]
 
 
-# ═══════════════════════════════════════════════════════════════════
 #  Extração de partes processuais
-# ═══════════════════════════════════════════════════════════════════
 
 _RE_CPF = re.compile(r"\d{3}\.\d{3}\.\d{3}-\d{2}")
 _RE_NOME = re.compile(r"[A-ZÁÉÍÓÚÂÊÎÔÛÃÕÇ][a-záéíóúâêîôûãõç]+(?:\s+[A-ZÁÉÍÓÚÂÊÎÔÛÃÕÇ][a-záéíóúâêîôûãõç]+){1,6}")
@@ -224,18 +208,14 @@ def _extrair_partes(texto: str) -> list[dict]:
     return unicos
 
 
-# ═══════════════════════════════════════════════════════════════════
 #  Log estruturado por PDF
-# ═══════════════════════════════════════════════════════════════════
 
 def _salvar_log(nome_saida: str, log: dict) -> None:
     log_path = DIR_SAIDA / nome_saida.replace(".md", ".log.json")
     log_path.write_text(json.dumps(log, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-# ═══════════════════════════════════════════════════════════════════
 #  Pipeline principal
-# ═══════════════════════════════════════════════════════════════════
 
 def processar_pdf(pdf_path: str, prog=None) -> dict:
     import pymupdf4llm
@@ -382,9 +362,7 @@ def processar_pdf(pdf_path: str, prog=None) -> dict:
     return resultado
 
 
-# ═══════════════════════════════════════════════════════════════════
 #  Geração do markdown — blocos independentes
-# ═══════════════════════════════════════════════════════════════════
 
 def _bloco_cabecalho(numero: str, meta: dict, n_paginas: int) -> list[str]:
     info = [x for x in [meta["classe"], meta["assunto"], f"{n_paginas} págs"] if x]
@@ -528,9 +506,7 @@ def _gerar_markdown(
     return "\n".join(blocos)
 
 
-# ═══════════════════════════════════════════════════════════════════
 #  Loop principal
-# ═══════════════════════════════════════════════════════════════════
 
 def main():
     print(f"\n{'=' * 60}\n  EXTRAÇÃO — PJe/TJBA (pymupdf4llm)\n{'=' * 60}")

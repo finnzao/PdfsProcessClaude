@@ -11,3 +11,8 @@ relatorio_extracao.json
 services/*/resultados/
 result/
 *.csv
+*.json
+*.log
+*.csv
+*.xlsx
+services/**/*.txt
