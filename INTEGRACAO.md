@@ -31,7 +31,7 @@ nova CLI, que cobre as quatro etapas do pipeline (reconciliar, pré-extrair,
 consolidar, pipeline). Faça backup antes se quiser preservar lógica.
 
 ## Sobre `requirements.txt`
-
+https://github.com/tesseract-ocr/tessdata_best/raw/main/por.traineddata
 Adicione (ou faça merge) as três dependências na raiz do seu projeto:
 
 ```
