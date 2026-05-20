@@ -19,7 +19,7 @@ Pula grupos já listados em controle_grupos.json (a menos que --forcar).
 Uso:
     python -m services.litispendencia.scripts.fila_litispendencia
     python -m services.litispendencia.scripts.fila_litispendencia --xlsx files/litispendencia_2.xlsx
-    python -m services.litispendencia.scripts.fila_litispendencia --abas "⭐ Litispendência,⚠ Coisa Julgada"
+    python -m services.litispendencia.scripts.fila_litispendencia --abas "Litispendência,Coisa Julgada"
     python -m services.litispendencia.scripts.fila_litispendencia --forcar
 """
 
@@ -27,6 +27,7 @@ import argparse
 import json
 import re
 import sys
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 
@@ -46,16 +47,37 @@ TEXTOS_DIR = RAIZ / "textos_extraidos"
 ALVO_PROCS_POR_CMD = 6       # alvo para grupos pequenos
 LIMITE_GRUPO_GRANDE = 6      # 6+ procs = sempre isolado
 
-# Mapa de aba → prefixo do group_id
+# Mapa de aba → prefixo do group_id (chaves normalizadas: sem acento, lower)
 PREFIXO_ABA = {
-    "⭐ Litispendência": "lit",
-    "⚠ Coisa Julgada": "cj",
-    "Filtro Estrito": "estrito",
-    "Filtro Médio": "medio",
-    "Filtro Amplo": "amplo",
+    "litispendencia": "lit",
+    "coisa julgada": "cj",
+    "filtro estrito": "estrito",
+    "filtro medio": "medio",
+    "filtro amplo": "amplo",
 }
 
-ABAS_DEFAULT = ["⭐ Litispendência", "⚠ Coisa Julgada"]
+ABAS_DEFAULT = ["Litispendência", "Coisa Julgada"]
+
+# Variantes antigas (com emoji) → nome canônico atual. Mantém compat.
+ALIASES_ABA = {
+    "⭐ Litispendência": "Litispendência",
+    "⚠ Coisa Julgada": "Coisa Julgada",
+}
+
+
+def _normalizar_chave(s: str) -> str:
+    """Remove acentos, espaços extras e emojis, lowercase. Para casamento robusto."""
+    if not s:
+        return ""
+    # Remove caracteres não-ASCII tipo emoji
+    sem_emoji = "".join(c for c in s if c.isprintable() and ord(c) < 0x2700)
+    nfkd = unicodedata.normalize("NFKD", sem_emoji)
+    sem_acento = "".join(c for c in nfkd if not unicodedata.combining(c))
+    return re.sub(r"\s+", " ", sem_acento).strip().lower()
+
+
+def _prefixo_para_aba(aba_nome: str) -> str:
+    return PREFIXO_ABA.get(_normalizar_chave(aba_nome), "grp")
 
 
 def carregar_controle():
@@ -80,17 +102,83 @@ def md_existe(numero_cnj):
     return (TEXTOS_DIR / num_para_md(numero_cnj)).exists()
 
 
-def ler_xlsx(xlsx_path: Path, abas: list[str]) -> list[dict]:
-    """Lê grupos das abas pedidas, retorna lista normalizada.
+def _resolver_aba(nome_pedido: str, abas_workbook: list[str]) -> str | None:
+    """Resolve o nome da aba lidando com alias (emoji antigo) e acentos.
 
-    Cada item: {
+    Retorna o nome exato como está no workbook, ou None se não houver match.
+    """
+    # 1. Match exato
+    if nome_pedido in abas_workbook:
+        return nome_pedido
+
+    # 2. Alias direto (emoji antigo → novo nome)
+    if nome_pedido in ALIASES_ABA:
+        alvo = ALIASES_ABA[nome_pedido]
+        if alvo in abas_workbook:
+            return alvo
+
+    # 3. Match normalizado (sem acento, sem emoji, lower)
+    pedido_norm = _normalizar_chave(nome_pedido)
+    for nome_real in abas_workbook:
+        if _normalizar_chave(nome_real) == pedido_norm:
+            return nome_real
+
+    return None
+
+
+def _detectar_linha_cabecalho(ws, max_busca: int = 5) -> tuple[int, list[str]]:
+    """Encontra a linha com 'Grupo' e 'Nº Processo' nas primeiras N linhas.
+
+    Retorna (numero_linha_1based, lista_cabecalho_strings).
+    A linha 1 da planilha costuma ser um título descritivo mesclado; o
+    cabeçalho real está na linha 2 nesta planilha. Detectamos por conteúdo
+    em vez de assumir posição.
+    """
+    for n_linha, row in enumerate(ws.iter_rows(min_row=1, max_row=max_busca, values_only=True), 1):
+        cab = [str(c).strip() if c is not None else "" for c in row]
+        cab_norm = [_normalizar_chave(c) for c in cab]
+        tem_grupo = any(c == "grupo" for c in cab_norm)
+        tem_processo = any("processo" in c for c in cab_norm)
+        if tem_grupo and tem_processo:
+            return n_linha, cab
+    return 1, []
+
+
+def _achar_coluna(cabecalho: list[str], *nomes_alvo: str) -> int | None:
+    """Procura coluna pelo nome (normalizado). Aceita match exato ou substring."""
+    alvos = [_normalizar_chave(n) for n in nomes_alvo]
+    cab_norm = [_normalizar_chave(c) for c in cabecalho]
+
+    # 1. Match exato
+    for i, c in enumerate(cab_norm):
+        if c in alvos:
+            return i
+    # 2. Match por substring (qualquer alvo dentro do cabeçalho da coluna)
+    for i, c in enumerate(cab_norm):
+        for alvo in alvos:
+            if alvo and alvo in c:
+                return i
+    return None
+
+
+def ler_xlsx(xlsx_path: Path, abas: list[str]) -> list[dict]:
+    """Lê grupos das abas pedidas. Detecta cabeçalho dinamicamente.
+
+    Estrutura esperada da planilha:
+      - Linha 1: título descritivo mesclado
+      - Linha 2: cabeçalho (Grupo, Polo Ativo, Polo Passivo, Classe, Assunto,
+                 Nº Processo, Data Chegada, Tarefa Atual, Status, ...)
+      - Linha 3+: uma linha por processo, agrupados pela coluna 'Grupo'
+
+    Cada item retornado: {
       'group_id': 'lit_001',
-      'aba_origem': '⭐ Litispendência',
+      'aba_origem': 'Litispendência',
       'processos': ['0001234-...', ...],
       'n_processos': N,
-      'partes_amostra': 'NOME (autor) vs NOME (réu)' (opcional),
-      'classe_amostra': '...' (opcional),
-      'assunto_amostra': '...' (opcional)
+      'partes_amostra': 'AUTOR vs RÉU',
+      'classe_amostra': 'CumSenFaz',
+      'assunto_amostra': 'Execução Contratual',
+      'status_amostra': 'ARQUIVADO; ATIVO; ...'
     }
     """
     try:
@@ -100,94 +188,114 @@ def ler_xlsx(xlsx_path: Path, abas: list[str]) -> list[dict]:
         sys.exit(1)
 
     wb = load_workbook(xlsx_path, read_only=True, data_only=True)
-    grupos = []
+    grupos_out = []
     contadores = {}
 
     re_cnj = re.compile(r"\d{7}-\d{2}\.\d{4}\.\d\.\d{2}\.\d{4}")
 
-    for aba_nome in abas:
-        if aba_nome not in wb.sheetnames:
-            print(f"  ⚠️  Aba não encontrada: {aba_nome}")
+    for aba_pedida in abas:
+        aba_real = _resolver_aba(aba_pedida, wb.sheetnames)
+        if not aba_real:
+            print(f"  ⚠️  Aba não encontrada: {aba_pedida!r}")
+            print(f"     Disponíveis: {', '.join(repr(s) for s in wb.sheetnames)}")
             continue
+        if aba_real != aba_pedida:
+            print(f"  ℹ️  Aba {aba_pedida!r} mapeada para {aba_real!r}")
 
-        ws = wb[aba_nome]
-        prefixo = PREFIXO_ABA.get(aba_nome, "grp")
+        ws = wb[aba_real]
+        prefixo = _prefixo_para_aba(aba_real)
         contadores.setdefault(prefixo, 0)
 
-        # Detecta cabeçalho lendo primeira linha
-        primeira_linha = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), None)
-        if not primeira_linha:
+        # Detecta linha do cabeçalho e identifica colunas pelos nomes
+        linha_cab, cabecalho = _detectar_linha_cabecalho(ws)
+        if not cabecalho:
+            print(f"  ⚠️  Cabeçalho não detectado em {aba_real!r}, pulando")
             continue
-        cabecalho = [str(c).strip() if c else "" for c in primeira_linha]
 
-        # Procura colunas relevantes (heurística: a aba tem múltiplas colunas
-        # de processo OU uma coluna "processos" concatenada)
-        col_processos_unica = None
-        cols_processos_indiv = []
-        col_partes = None
-        col_classe = None
-        col_assunto = None
+        col_grupo = _achar_coluna(cabecalho, "Grupo")
+        col_proc = _achar_coluna(cabecalho, "Nº Processo", "N Processo", "Numero do Processo", "Processo")
+        col_polo_ativo = _achar_coluna(cabecalho, "Polo Ativo")
+        col_polo_passivo = _achar_coluna(cabecalho, "Polo Passivo")
+        col_classe = _achar_coluna(cabecalho, "Classe")
+        col_assunto = _achar_coluna(cabecalho, "Assunto")
+        col_status = _achar_coluna(cabecalho, "Status")
 
-        for i, col in enumerate(cabecalho):
-            col_low = col.lower()
-            if col_low in ("processos", "numeros_processos", "lista_processos"):
-                col_processos_unica = i
-            elif col_low.startswith("processo") or col_low.startswith("numero"):
-                cols_processos_indiv.append(i)
-            elif "parte" in col_low:
-                col_partes = i
-            elif "classe" in col_low:
-                col_classe = i
-            elif "assunto" in col_low:
-                col_assunto = i
+        if col_grupo is None or col_proc is None:
+            print(f"  ⚠️  {aba_real!r}: faltam colunas 'Grupo' ou 'Nº Processo' (cabeçalho linha {linha_cab})")
+            continue
 
-        for row in ws.iter_rows(min_row=2, values_only=True):
+        # Agrupar pelas linhas de dados (após o cabeçalho)
+        agrupados: dict[str, dict] = {}
+        for row in ws.iter_rows(min_row=linha_cab + 1, values_only=True):
             if not row or all(c is None for c in row):
                 continue
 
-            # Extrair lista de processos do row
-            cnjs = []
-            if col_processos_unica is not None:
-                celula = row[col_processos_unica]
-                if celula:
-                    cnjs = re_cnj.findall(str(celula))
-            elif cols_processos_indiv:
-                for i in cols_processos_indiv:
-                    if i < len(row) and row[i]:
-                        encontrados = re_cnj.findall(str(row[i]))
-                        cnjs.extend(encontrados)
-            else:
-                # Fallback: varre todas as células procurando CNJs
-                for cel in row:
-                    if cel:
-                        cnjs.extend(re_cnj.findall(str(cel)))
+            grupo_val = row[col_grupo] if col_grupo < len(row) else None
+            proc_val = row[col_proc] if col_proc < len(row) else None
+            if not grupo_val or not proc_val:
+                continue
 
-            # Dedup preservando ordem
-            vistos = set()
-            cnjs_unicos = []
-            for c in cnjs:
-                if c not in vistos:
-                    vistos.add(c)
-                    cnjs_unicos.append(c)
+            grupo_chave = str(grupo_val).strip()
+            cnj_match = re_cnj.search(str(proc_val))
+            if not cnj_match:
+                continue
+            cnj = cnj_match.group(0)
 
-            if len(cnjs_unicos) < 2:
-                continue  # grupo tem que ter ao menos 2 processos
+            g = agrupados.setdefault(grupo_chave, {
+                "processos": [],
+                "polos_ativos": [],
+                "polos_passivos": [],
+                "classes": [],
+                "assuntos": [],
+                "status": [],
+            })
+            if cnj not in g["processos"]:
+                g["processos"].append(cnj)
+
+            def _add(lista, idx):
+                if idx is not None and idx < len(row) and row[idx]:
+                    v = str(row[idx]).strip()
+                    if v and v not in lista:
+                        lista.append(v)
+
+            _add(g["polos_ativos"], col_polo_ativo)
+            _add(g["polos_passivos"], col_polo_passivo)
+            _add(g["classes"], col_classe)
+            _add(g["assuntos"], col_assunto)
+            _add(g["status"], col_status)
+
+        # Materializa grupos válidos (≥ 2 processos)
+        # Ordena por nome (Grupo 1, Grupo 2, ...) com fallback alfabético
+        def _chave_ordem(nome):
+            m = re.search(r"(\d+)", nome)
+            return (0, int(m.group(1))) if m else (1, nome)
+
+        for grupo_chave in sorted(agrupados.keys(), key=_chave_ordem):
+            g = agrupados[grupo_chave]
+            if len(g["processos"]) < 2:
+                continue
 
             contadores[prefixo] += 1
             group_id = f"{prefixo}_{contadores[prefixo]:03d}"
 
-            grupos.append({
+            ativos = " ↔ ".join(g["polos_ativos"][:2]) or ""
+            passivos = " ↔ ".join(g["polos_passivos"][:2]) or ""
+            partes_amostra = f"{ativos} vs {passivos}" if ativos or passivos else ""
+
+            grupos_out.append({
                 "group_id": group_id,
-                "aba_origem": aba_nome,
-                "processos": cnjs_unicos,
-                "n_processos": len(cnjs_unicos),
-                "partes_amostra": str(row[col_partes]).strip() if col_partes is not None and col_partes < len(row) and row[col_partes] else "",
-                "classe_amostra": str(row[col_classe]).strip() if col_classe is not None and col_classe < len(row) and row[col_classe] else "",
-                "assunto_amostra": str(row[col_assunto]).strip() if col_assunto is not None and col_assunto < len(row) and row[col_assunto] else "",
+                "aba_origem": aba_real,
+                "grupo_planilha": grupo_chave,
+                "processos": g["processos"],
+                "n_processos": len(g["processos"]),
+                "partes_amostra": partes_amostra[:160],
+                "classe_amostra": "; ".join(g["classes"][:3]),
+                "assunto_amostra": "; ".join(g["assuntos"][:3]),
+                "status_amostra": "; ".join(g["status"][:5]),
             })
 
     wb.close()
-    return grupos
+    return grupos_out
 
 
 def empacotar_adaptativo(grupos: list[dict]) -> list[list[dict]]:
@@ -235,17 +343,19 @@ def gerar_texto_cmd(num_cmd: int, grupos_do_cmd: list[dict]) -> str:
     # Tabela de grupos no comando
     linhas_tabela = []
     for g in grupos_do_cmd:
+        cab_linha = f"  {g['group_id']:<12} [{g['aba_origem']} / {g.get('grupo_planilha', '?')}]"
+        linhas_tabela.append(cab_linha)
         for cnj in g["processos"]:
             existe = "✓" if md_existe(cnj) else "✗"
-            linhas_tabela.append(
-                f"  {g['group_id']:<12} | {cnj} | md={existe}"
-            )
+            linhas_tabela.append(f"  {'':12}   - {cnj}  (md={existe})")
         if g.get("partes_amostra"):
-            linhas_tabela.append(f"  {'':12}   partes: {g['partes_amostra'][:80]}")
+            linhas_tabela.append(f"  {'':12}   partes: {g['partes_amostra'][:120]}")
         if g.get("classe_amostra") or g.get("assunto_amostra"):
             ca = g.get("classe_amostra", "")
             ass = g.get("assunto_amostra", "")
             linhas_tabela.append(f"  {'':12}   classe/assunto: {ca} / {ass}")
+        if g.get("status_amostra"):
+            linhas_tabela.append(f"  {'':12}   status: {g['status_amostra']}")
         linhas_tabela.append("")
 
     tabela = "\n".join(linhas_tabela).rstrip()
@@ -310,9 +420,17 @@ def gerar_fila(xlsx_path: Path, abas: list[str], forcar: bool):
     grupos = ler_xlsx(xlsx_path, abas)
     if not grupos:
         print(f"  ✗ Nenhum grupo extraído das abas pedidas.")
+        print(f"     Dicas:")
+        print(f"       - Verifique se os nomes das abas estão corretos (--abas '...')")
+        print(f"       - Verifique se há ao menos 2 processos por valor de 'Grupo'")
         sys.exit(1)
 
     print(f"\n  Grupos encontrados: {len(grupos)}")
+    por_aba = {}
+    for g in grupos:
+        por_aba[g["aba_origem"]] = por_aba.get(g["aba_origem"], 0) + 1
+    for aba, n in por_aba.items():
+        print(f"    {aba}: {n} grupos")
 
     # Filtrar já analisados
     controle = carregar_controle()
@@ -338,6 +456,11 @@ def gerar_fila(xlsx_path: Path, abas: list[str], forcar: bool):
     print(f"    Pequenos (2-3 procs):  {pequenos}")
     print(f"    Médios   (4-5 procs):  {medios}")
     print(f"    Grandes  (6+ procs):   {grandes}")
+
+    # Cobertura de .md
+    todos_procs = [c for g in grupos for c in g["processos"]]
+    com_md = sum(1 for c in todos_procs if md_existe(c))
+    print(f"\n  Cobertura de textos_extraidos/: {com_md}/{len(todos_procs)} processos têm .md")
 
     # Empacotar adaptativo
     cmds_pacotes = empacotar_adaptativo(grupos)
@@ -376,6 +499,7 @@ def gerar_fila(xlsx_path: Path, abas: list[str], forcar: bool):
             {
                 "group_id": g["group_id"],
                 "aba_origem": g["aba_origem"],
+                "grupo_planilha": g.get("grupo_planilha", ""),
                 "n_processos": g["n_processos"],
                 "processos": g["processos"],
             }

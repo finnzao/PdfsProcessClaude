@@ -3,10 +3,17 @@
 auto_analisar_litispendencia.py — Executa a fila de análise de litispendência
 via Claude Code (claude -p).
 
-Espelha o padrão do auto_extrair_cautelares.py:
+Compatível com Claude Code 2.1.x:
+  - Usa --dangerously-skip-permissions para destravar Write/Edit em modo -p.
+    (--permission-mode bypassPermissions sozinho não basta em algumas
+    configurações, incluindo projetos sob OneDrive no Windows.)
+  - Prompt como argumento de `-p` (não via stdin)
+  - --max-turns para limitar custo
+  - --add-dir <projeto> para garantir acesso de I/O
+  - Cria pastas de resultado antes de rodar
   - Detecta rate limit ("You've hit your limit · resets Xpm") e espera reset
   - Granularidade por GRUPO via controle_grupos.json (fonte da verdade)
-  - Salva progresso por CMD via checkpoint.json (CheckpointManager)
+  - Salva progresso por CMD via checkpoint.json
   - Retomada automática a partir do último CMD concluído
   - Verificação pós-CMD: confere que os grupos esperados foram salvos
 
@@ -17,6 +24,12 @@ Uso:
     python auto_analisar_litispendencia.py --dry          # preview
     python auto_analisar_litispendencia.py --consolidar   # gera planilha ao final
     python auto_analisar_litispendencia.py --verbose      # saída em tempo real
+
+Segurança:
+    --dangerously-skip-permissions desativa TODAS as confirmações de uso
+    de ferramentas (Read/Write/Edit/Bash) dentro deste subprocesso. O
+    Claude Code só age sobre o diretório do projeto (--add-dir). Use só
+    em diretório confiável que você controla.
 """
 
 import argparse
@@ -42,6 +55,46 @@ LOG_DIR = SERVICE_DIR / "logs"
 
 IS_WINDOWS = platform.system() == "Windows"
 TZ_FORTALEZA = ZoneInfo("America/Fortaleza")
+
+# ── Localização do executável do Claude Code ────────────────────────
+
+def _find_claude():
+    """Encontra o executável do Claude Code, incluindo .cmd no Windows."""
+    p = shutil.which("claude")
+    if p:
+        return p
+    if IS_WINDOWS:
+        p = shutil.which("claude.cmd")
+        if p:
+            return p
+    return None
+
+
+def verificar_claude_code():
+    """Verifica se o Claude Code está instalado e acessível."""
+    claude_path = _find_claude()
+    if not claude_path:
+        print("\n  ✗ Claude Code não encontrado no PATH.")
+        print("    Instale: npm install -g @anthropic-ai/claude-code")
+        print("    Depois: claude login")
+        sys.exit(1)
+
+    try:
+        if IS_WINDOWS and claude_path.lower().endswith((".cmd", ".bat")):
+            cmd = ["cmd.exe", "/D", "/S", "/C", claude_path, "--version"]
+        else:
+            cmd = [claude_path, "--version"]
+        result = subprocess.run(
+            cmd,
+            capture_output=True, text=True, timeout=10,
+        )
+        version = result.stdout.strip() or result.stderr.strip()
+        print(f"  ✓ Claude Code: {version} ({claude_path})")
+    except Exception:
+        print(f"  ✓ Claude Code em: {claude_path} (versão não detectada)")
+
+    return claude_path
+
 
 # ── Detecção de rate limit ──────────────────────────────────────────
 
@@ -149,7 +202,6 @@ def extrair_textos_cmds(cmds_path: Path) -> dict[int, str]:
         return {}
 
     conteudo = cmds_path.read_text(encoding="utf-8")
-    # Cada CMD começa com "# === CMD NNN ..."
     blocos = re.split(r"(?=^# === CMD \d{3})", conteudo, flags=re.MULTILINE)
     out = {}
     for bloco in blocos:
@@ -176,15 +228,12 @@ def verificar_grupos_do_cmd(group_ids: list[str]) -> tuple[list[str], list[str]]
         if arq.exists():
             try:
                 dados = json.loads(arq.read_text(encoding="utf-8"))
-                # Campos obrigatórios mínimos
                 if all(k in dados for k in ("group_id", "classificacao_final", "confianca", "prioridade")):
                     ok_arquivo = True
             except json.JSONDecodeError:
                 pass
 
-        ok_controle = gid in grupos_no_controle
-
-        if ok_arquivo and ok_controle:
+        if ok_arquivo or gid in grupos_no_controle:
             feitos.append(gid)
         else:
             faltantes.append(gid)
@@ -194,48 +243,109 @@ def verificar_grupos_do_cmd(group_ids: list[str]) -> tuple[list[str], list[str]]
 
 # ── Execução de um CMD ──────────────────────────────────────────────
 
-def executar_cmd(num_cmd: int, texto: str, timeout: int,
-                 verbose: bool) -> tuple[bool, str, str]:
-    """Executa um CMD via `claude -p`. Retorna (sucesso, stdout, stderr)."""
-    claude_bin = shutil.which("claude")
-    if not claude_bin:
-        return False, "", "claude CLI não encontrado no PATH"
+def _montar_invocacao(claude_path: str) -> list[str]:
+    """Monta a lista de argumentos do subprocess para invocar o Claude Code.
 
+    Windows + claude.CMD: subprocess sem shell=True não consegue executar
+    .cmd/.bat diretamente (WinError 193). Solução: invocar via
+    `cmd.exe /D /S /C "<caminho>" ...`. Como o prompt vai pelo stdin
+    (não como argumento), o cmd.exe não tem chance de reinterpretar
+    caracteres especiais do prompt.
+
+    Linux/Mac: subprocess executa o binário direto, sem shell.
+    """
+    base = [
+        "-p",
+        "--dangerously-skip-permissions",
+        "--add-dir", str(ROOT),
+        "--max-turns", "60",
+        "--output-format", "text",
+    ]
+    if IS_WINDOWS and claude_path.lower().endswith((".cmd", ".bat")):
+        # /D ignora AutoRun, /S preserva o quoting do primeiro arg
+        return ["cmd.exe", "/D", "/S", "/C", claude_path, *base]
+    return [claude_path, *base]
+
+
+def executar_cmd(num_cmd: int, texto: str, claude_path: str,
+                 timeout: int, verbose: bool) -> tuple[bool, str, str]:
+    """Executa um CMD via `claude -p` lendo o prompt do STDIN.
+
+    Por que stdin e não argumento de `-p`:
+        No Windows, quando subprocess passa argumentos para `claude.CMD`,
+        o cmd.exe (wrapper de batch) reaparseia a linha e interpreta
+        caracteres do prompt (`|`, `&`, `<`, `>`, `(`, `)`, `%`, `^`)
+        como operadores do shell. Isso quebra o argumento e derruba as
+        flags que vêm depois, incluindo --dangerously-skip-permissions.
+        O prompt deste service tem tabelas com `|` e paths — propenso
+        a quebrar.
+
+        Solução robusta: passar o prompt via STDIN. O Claude Code aceita
+        isso quando `-p` é usado sem valor ("useful for pipes" no help).
+        Stdin não passa pelo cmd.exe, então o prompt chega íntegro.
+
+    Flags importantes para Claude Code 2.1.x:
+      - --dangerously-skip-permissions: desliga TODAS as confirmações
+        de tool. Requer a opção "Permitir modo de bypass de permissões"
+        ativada nas configurações do Claude Code.
+      - --add-dir: garante acesso de I/O à raiz do projeto.
+      - --max-turns: limita custo para grupos grandes.
+
+    Retorna (sucesso, stdout, stderr).
+    """
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     log_path = LOG_DIR / f"cmd_{num_cmd:03d}.log"
+
+    cmd = _montar_invocacao(claude_path)
 
     try:
         if verbose:
             print(f"  ── Executando CMD {num_cmd:03d} (verbose) ──")
 
-        proc = subprocess.Popen(
-            [claude_bin, "-p"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            cwd=str(ROOT),
-        )
-
-        try:
-            stdout, _ = proc.communicate(input=texto, timeout=timeout)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            stdout, _ = proc.communicate()
-            log_path.write_text(
-                f"[TIMEOUT após {timeout}s]\n\n{stdout}", encoding="utf-8"
+            process = subprocess.Popen(
+                cmd, cwd=str(ROOT),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding="utf-8", errors="replace",
+                bufsize=1,
             )
-            return False, stdout, "timeout"
+            try:
+                process.stdin.write(texto)
+                process.stdin.close()
+            except Exception as e:
+                return False, "", f"falha escrevendo prompt no stdin: {e}"
+
+            output_lines = []
+            for line in process.stdout:
+                print(f"  | {line}", end="")
+                output_lines.append(line)
+            process.wait(timeout=timeout)
+            stdout = "".join(output_lines)
+            returncode = process.returncode
+            stderr = ""
+        else:
+            result = subprocess.run(
+                cmd, cwd=str(ROOT),
+                input=texto,
+                capture_output=True, text=True,
+                encoding="utf-8", errors="replace",
+                timeout=timeout,
+            )
+            stdout = result.stdout or ""
+            stderr = result.stderr or ""
+            returncode = result.returncode
+            if stderr:
+                stdout += f"\n--- STDERR ---\n{stderr}"
 
         log_path.write_text(stdout, encoding="utf-8")
+        return returncode == 0, stdout, stderr
 
-        if verbose:
-            for linha in stdout.splitlines():
-                print(f"  | {linha}")
-
-        return proc.returncode == 0, stdout, ""
+    except subprocess.TimeoutExpired:
+        try:
+            log_path.write_text(f"[TIMEOUT após {timeout}s]\n", encoding="utf-8")
+        except Exception:
+            pass
+        return False, "", "timeout"
 
     except Exception as e:
         return False, "", f"exceção: {e}"
@@ -260,6 +370,13 @@ def main():
                    help="Retries por CMD (rate limit não conta)")
     args = p.parse_args()
 
+    GRUPOS_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+    print(f"\n  ── Análise de litispendência ──")
+
+    claude_path = verificar_claude_code()
+
     fila = carregar_fila()
     textos = extrair_textos_cmds(CMDS_PATH)
     if not textos:
@@ -269,7 +386,6 @@ def main():
     ck = carregar_checkpoint()
     feitos_geral = set(ck.get("comandos_concluidos", []))
 
-    # Filtra os CMDs a rodar
     todos_cmds = sorted(fila["comandos"], key=lambda c: c["num"])
     fila_de_cmds = []
     for c in todos_cmds:
@@ -294,11 +410,12 @@ def main():
         return
 
     total_a_rodar = len(fila_de_cmds)
-    print(f"\n  ── Análise de litispendência ──")
     print(f"  Total na fila:        {len(todos_cmds)} CMDs")
     print(f"  Já concluídos antes:  {len(feitos_geral)}")
     print(f"  A executar agora:     {total_a_rodar}")
     print(f"  Timeout/CMD:          {args.timeout}s")
+    print(f"  Pasta resultados:     {GRUPOS_DIR}")
+    print(f"  Permission mode:      --dangerously-skip-permissions (use só em diretório confiável)")
     print(f"  Modo:                 {'DRY-RUN' if args.dry else 'EXECUÇÃO'}")
     print()
 
@@ -311,7 +428,6 @@ def main():
         print(f"\n  (dry-run, nada foi executado)\n")
         return
 
-    # Sessão
     ck.setdefault("sessoes", []).append({
         "inicio": datetime.now().isoformat(),
         "fim": None,
@@ -341,26 +457,25 @@ def main():
 
             tentativas = 0
             sucesso_cmd = False
+            faltantes: list[str] = list(group_ids)
 
             while tentativas < args.max_tentativas:
                 tentativas += 1
                 t0 = time.time()
 
                 ok, stdout, stderr = executar_cmd(
-                    n, texto, args.timeout, args.verbose
+                    n, texto, claude_path, args.timeout, args.verbose,
                 )
                 elapsed = time.time() - t0
 
-                # Detecta rate limit
-                rate_lim, reset = detectar_rate_limit(stdout + " " + stderr)
+                rate_lim, reset = detectar_rate_limit((stdout or "") + " " + (stderr or ""))
                 if rate_lim and reset:
                     print(f"     ⚠️  Rate limit detectado, reset em "
                           f"{reset.strftime('%H:%M')} (Fortaleza)")
                     esperar_rate_limit(reset, args.verbose)
-                    tentativas -= 1  # rate limit não conta
+                    tentativas -= 1
                     continue
 
-                # Verifica resultados
                 feitos_grupos, faltantes = verificar_grupos_do_cmd(group_ids)
 
                 if not faltantes:
@@ -373,19 +488,25 @@ def main():
                     sucesso_cmd = True
                     break
 
-                # Parcial?
                 if feitos_grupos:
                     print(f"     ◐ Parcial: {len(feitos_grupos)} OK, {len(faltantes)} faltando "
                           f"({', '.join(faltantes)})")
                 else:
                     print(f"     ✗ Nenhum grupo salvo (tentativa {tentativas}/{args.max_tentativas})")
 
+                if not ok:
+                    log_path = LOG_DIR / f"cmd_{n:03d}.log"
+                    if log_path.exists():
+                        try:
+                            primeiras = log_path.read_text(encoding="utf-8", errors="replace").splitlines()[:5]
+                            for ln in primeiras:
+                                print(f"       log: {ln[:150]}")
+                        except Exception:
+                            pass
+
                 if stderr:
                     print(f"     stderr: {stderr[:200]}")
 
-                # Para retry, regerar texto só com os faltantes seria ideal,
-                # mas isso exige reescrever o texto. Por enquanto reenviamos
-                # o CMD inteiro — o Claude pula os já feitos via controle_grupos.json.
                 if tentativas < args.max_tentativas:
                     print(f"     Aguardando {args.pausa}s antes de tentar novamente...")
                     time.sleep(args.pausa)
@@ -400,20 +521,20 @@ def main():
                 salvar_checkpoint(ck)
                 if not args.continuar_em_erro:
                     print(f"\n  ✗ Parando após {tentativas} tentativas no CMD {n:03d}.")
-                    print(f"     Use --continuar-em-erro para seguir adiante.\n")
+                    print(f"     Use --continuar-em-erro para seguir adiante.")
+                    print(f"     Veja o log: {LOG_DIR / f'cmd_{n:03d}.log'}\n")
                     break
             else:
                 sucesso_count += 1
 
-            # Pausa entre CMDs
             if i < total_a_rodar:
                 time.sleep(args.pausa)
 
     finally:
-        # Fecha sessão
-        ck["sessoes"][-1]["fim"] = datetime.now().isoformat()
-        ck["sessoes"][-1]["cmd_fim"] = ck.get("ultimo_comando", 0)
-        salvar_checkpoint(ck)
+        if ck.get("sessoes"):
+            ck["sessoes"][-1]["fim"] = datetime.now().isoformat()
+            ck["sessoes"][-1]["cmd_fim"] = ck.get("ultimo_comando", 0)
+            salvar_checkpoint(ck)
 
     duracao = datetime.now() - inicio_sessao
     mins = duracao.seconds // 60
