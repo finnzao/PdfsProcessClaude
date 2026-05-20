@@ -1,6 +1,11 @@
 """common — Pipeline de extracao PDF -> markdown."""
 
-from common.extrator_pdf import processar_pdf, cache_key_arquivo, versao_utils
+from common.extrator_pdf import (
+    processar_pdf,
+    cache_key_arquivo,
+    versao_utils,
+    ResultadoExtracao,
+)
 from common.utils_io import (
     extrair_numero_processo,
     num_para_arquivo,
@@ -26,6 +31,7 @@ __all__ = [
     "processar_pdf",
     "cache_key_arquivo",
     "versao_utils",
+    "ResultadoExtracao",
     "extrair_numero_processo",
     "num_para_arquivo",
     "formatar_doc_ids",

@@ -1,23 +1,5 @@
 """
 common/reconciliador.py — Casa nomes da lista do papel (xlsx) com nomes do PJe.
-
-Estratégia em 3 camadas, confiança decrescente:
-  1. Âncora pelo número do processo (CNJ) — mais confiável
-  2. Match exato após normalização (sem acentos, lowercase, tokens ordenados)
-  3. Fuzzy matching com rapidfuzz para erros ortográficos
-
-Uso:
-    from common.reconciliador import Reconciliador
-
-    rec = Reconciliador()
-    rec.carregar_lista_papel("files/lista_cadastro_scc.xlsx")
-    rec.carregar_pje("files/scc_info.csv")
-
-    rec.reconciliar()
-    rec.exportar_relatorio("result/reconciliacao.xlsx")
-
-Dependências:
-    pip install rapidfuzz openpyxl unidecode
 """
 
 import re
@@ -34,23 +16,12 @@ except ImportError:
     raise ImportError("Instale: pip install rapidfuzz unidecode openpyxl")
 
 
-# ── Normalização ────────────────────────────────────────────────
-
-# Sufixos parentéticos comuns na lista do papel: "(BALCÃO)", "(APF)", "A.P"
 _RE_SUFIXO = re.compile(r"\s*[\(\[][^)\]]*[\)\]]\s*|\s+A\.?P\.?\s*$|\s+APF\s*$", re.I)
 _RE_CNJ = re.compile(r"\d{7}-\d{2}\.\d{4}\.\d{1}\.\d{2}\.\d{4}")
 _RE_ESPACOS = re.compile(r"\s+")
 
 
 def normalizar_nome(nome: str) -> str:
-    """
-    Normaliza nome para comparação:
-      - remove sufixos parentéticos
-      - remove acentos
-      - lowercase
-      - ordena tokens (resolve "Silva, João" vs "João Silva")
-      - colapsa espaços
-    """
     if not nome:
         return ""
     s = _RE_SUFIXO.sub(" ", nome)
@@ -61,31 +32,23 @@ def normalizar_nome(nome: str) -> str:
 
 
 def extrair_cnj(texto: str) -> Optional[str]:
-    """Extrai número CNJ do texto, se houver."""
     m = _RE_CNJ.search(texto or "")
     return m.group(0) if m else None
 
 
-# ── Modelo ──────────────────────────────────────────────────────
-
 @dataclass
 class Match:
-    """Resultado do casamento entre um item do papel e um do PJe."""
     papel_idx: int
     papel_nome: str
     papel_processo: str
     papel_livro: str
-
     pje_nome: Optional[str]
     pje_processo: Optional[str]
     pje_id_processo: Optional[str]
-
-    score: int                # 0-100
-    metodo: str               # "cnj" | "exato" | "fuzzy" | "sem_match"
+    score: int
+    metodo: str
     revisar: bool
 
-
-# ── Reconciliador ───────────────────────────────────────────────
 
 class Reconciliador:
 
@@ -135,7 +98,6 @@ class Reconciliador:
                     "nome_norm": normalizar_nome(nome),
                     "assunto": row.get("assuntoPrincipal", "").strip(),
                 })
-        # Deduplica por (numero_processo + nome)
         vistos = set()
         unicos = []
         for r in self.pje:
@@ -170,7 +132,6 @@ class Reconciliador:
             papel_livro=papel["livro"],
         )
 
-        # Camada 1: CNJ
         if papel["processo_cnj"] and papel["processo_cnj"] in pje_por_cnj:
             candidatos = pje_por_cnj[papel["processo_cnj"]]
             melhor = max(
@@ -188,7 +149,6 @@ class Reconciliador:
                 revisar=score_nome < 70,
             )
 
-        # Camada 2: nome exato
         if papel["nome_norm"] in pje_por_nome_norm:
             r = pje_por_nome_norm[papel["nome_norm"]]
             return Match(
@@ -201,7 +161,6 @@ class Reconciliador:
                 revisar=False,
             )
 
-        # Camada 3: fuzzy
         if pje_nomes_norm:
             res = process.extractOne(
                 papel["nome_norm"], pje_nomes_norm, scorer=fuzz.token_sort_ratio,
@@ -282,7 +241,6 @@ class Reconciliador:
         print(f"  Relatório: {xlsx_path}")
 
     def exportar_json(self, json_path: str | Path):
-        """Exporta dict numero_processo → match para uso em downstream."""
         data = {
             m.papel_processo: {
                 "papel_nome": m.papel_nome,

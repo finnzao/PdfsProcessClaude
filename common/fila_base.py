@@ -23,18 +23,22 @@ class FilaBase:
         self.resultados_dir.mkdir(exist_ok=True)
 
     def _ck(self):
-        if self.checkpoint_path.exists(): return json.loads(self.checkpoint_path.read_text(encoding='utf-8'))
+        if self.checkpoint_path.exists():
+            return json.loads(self.checkpoint_path.read_text(encoding='utf-8'))
         return {"processos_analisados": {}, "comandos_concluidos": [], "ultimo_comando": 0}
 
     def _prompt(self, classe):
         return self.CLASSE_PARA_PROMPT.get(classe, self._prompt_default())
 
-    def _prompt_default(self): return "prompt_outros.md"
+    def _prompt_default(self):
+        return "prompt_outros.md"
 
-    def gerar_comando_com_pdf(self, n, procs, prompt): raise NotImplementedError
-    def gerar_comando_sem_pdf(self, n, procs, prompt): raise NotImplementedError
+    def gerar_comando_com_pdf(self, n, procs, prompt):
+        raise NotImplementedError
 
-    # ── Mapeamento de filtro → classes do CSV ──
+    def gerar_comando_sem_pdf(self, n, procs, prompt):
+        raise NotImplementedError
+
     FILTRO_CLASSES = {
         "TCO":     ["Termo Circunstanciado", "TCO"],
         "IP":      ["Inquérito Policial", "IP"],
@@ -45,7 +49,6 @@ class FilaBase:
     }
 
     def _normalizar_classe(self, classe_csv: str) -> str:
-        """Converte nome do CSV para código interno."""
         cl = classe_csv.strip()
         for codigo, nomes in self.FILTRO_CLASSES.items():
             for nome in nomes:
@@ -54,11 +57,9 @@ class FilaBase:
         return cl
 
     def _filtrar_por_classes(self, processos: dict, filtros: list) -> dict:
-        """Filtra processos por uma ou mais classes processuais."""
         if not filtros:
             return processos
 
-        # Montar lista unificada de nomes aceitos
         nomes_aceitos = []
         for filtro in filtros:
             filtro_upper = filtro.upper().strip()
@@ -80,32 +81,14 @@ class FilaBase:
         return filtrado
 
     def _parse_filtro(self, args) -> list:
-        """Converte args em lista de classes.
-
-        Aceita:
-          ["TCO"]              -> ["TCO"]
-          ["TCO", "IP"]        -> ["TCO", "IP"]
-          ["TCO,IP"]           -> ["TCO", "IP"]
-          ["TCO+IP"]           -> ["TCO", "IP"]
-          ["TCO", "IP", "Juri"]-> ["TCO", "IP", "Juri"]
-        """
         if not args:
             return []
-        # Juntar tudo, separar por vírgula, +, ou espaço
         import re
         raw = " ".join(args) if isinstance(args, list) else str(args)
         partes = re.split(r'[,+\s]+', raw)
         return [p.strip() for p in partes if p.strip()]
 
     def gerar(self, filtro_classe=None):
-        """Monta todos os comandos e salva em .txt e .json.
-
-        filtro_classe: str, list, ou None.
-          str  -> uma classe ("TCO") ou várias separadas por vírgula/+  ("TCO,IP")
-          list -> ["TCO", "IP"]
-          None -> todas as classes
-        """
-        # Normalizar filtro para lista
         if isinstance(filtro_classe, str):
             filtros = self._parse_filtro([filtro_classe])
         elif isinstance(filtro_classe, list):
@@ -127,21 +110,23 @@ class FilaBase:
         else:
             label_filtro = ""
 
-        txts = {f.stem: f for f in DIR_TEXTOS.iterdir() if f.suffix in ('.txt','.md')} if DIR_TEXTOS.exists() else {}
+        txts = {f.stem: f for f in DIR_TEXTOS.iterdir() if f.suffix in ('.txt', '.md')} if DIR_TEXTOS.exists() else {}
         print(f"  Textos: {len(txts)}")
 
         ja = set(self._ck().get("processos_analisados", {}).keys())
         todos = []
         for num, d in csv_procs.items():
-            cl = d.get("Classe","").strip()
+            cl = d.get("Classe", "").strip()
             cl_codigo = self._normalizar_classe(cl)
             sc, urg = calcular_urgencia(d)
             tn = num_para_arquivo(num)
-            todos.append({"numero": num, "classe": cl_codigo, "assunto": d.get("Assunto",""),
-                "tarefa": d.get("Tarefa",""), "dias_parado": int(d.get("Dias",0)),
-                "ultima_mov": d.get("Última Movimentação",""), "urgencia": urg, "score": sc,
+            todos.append({
+                "numero": num, "classe": cl_codigo, "assunto": d.get("Assunto", ""),
+                "tarefa": d.get("Tarefa", ""), "dias_parado": int(d.get("Dias", 0)),
+                "ultima_mov": d.get("Última Movimentação", ""), "urgencia": urg, "score": sc,
                 "prompt": self._prompt(cl_codigo), "tem_pdf": Path(tn).stem in txts,
-                "txt_arquivo": tn, "ja": num in ja})
+                "txt_arquivo": tn, "ja": num in ja,
+            })
 
         com = sorted([p for p in todos if p["tem_pdf"] and not p["ja"]], key=lambda x: -x["score"])
         sem = sorted([p for p in todos if not p["tem_pdf"] and not p["ja"]], key=lambda x: -x["score"])
@@ -151,21 +136,30 @@ class FilaBase:
         cn = 0
         for prompt, grupo in sorted(defaultdict(list, {p["prompt"]: [] for p in com}).items()):
             for p in com:
-                if p["prompt"] == prompt: grupo.append(p)
+                if p["prompt"] == prompt:
+                    grupo.append(p)
             for i in range(0, len(grupo), self.BATCH_COM_PDF):
                 cn += 1
-                cmds.append({"num": cn, "texto": self.gerar_comando_com_pdf(cn, grupo[i:i+self.BATCH_COM_PDF], prompt),
-                    "processos": [p["numero"] for p in grupo[i:i+self.BATCH_COM_PDF]], "tipo": "COM_PDF"})
+                cmds.append({
+                    "num": cn,
+                    "texto": self.gerar_comando_com_pdf(cn, grupo[i:i + self.BATCH_COM_PDF], prompt),
+                    "processos": [p["numero"] for p in grupo[i:i + self.BATCH_COM_PDF]],
+                    "tipo": "COM_PDF",
+                })
 
         for prompt, grupo in sorted(defaultdict(list, {p["prompt"]: [] for p in sem}).items()):
             for p in sem:
-                if p["prompt"] == prompt: grupo.append(p)
+                if p["prompt"] == prompt:
+                    grupo.append(p)
             for i in range(0, len(grupo), self.BATCH_SEM_PDF):
                 cn += 1
-                cmds.append({"num": cn, "texto": self.gerar_comando_sem_pdf(cn, grupo[i:i+self.BATCH_SEM_PDF], prompt),
-                    "processos": [p["numero"] for p in grupo[i:i+self.BATCH_SEM_PDF]], "tipo": "SEM_PDF"})
+                cmds.append({
+                    "num": cn,
+                    "texto": self.gerar_comando_sem_pdf(cn, grupo[i:i + self.BATCH_SEM_PDF], prompt),
+                    "processos": [p["numero"] for p in grupo[i:i + self.BATCH_SEM_PDF]],
+                    "tipo": "SEM_PDF",
+                })
 
-        # Sufixo no nome do arquivo se filtrado
         sufixo = f"_{label_filtro.lower()}" if label_filtro else ""
 
         comandos_path = self.service_dir / f"comandos_claude_code{sufixo}.txt"
@@ -174,15 +168,16 @@ class FilaBase:
         with open(comandos_path, 'w', encoding='utf-8') as f:
             label_header = f" [{label_filtro}]" if label_filtro else ""
             f.write(f"# {self.SERVICE_NAME}{label_header} — {cn} comandos — {datetime.now():%d/%m/%Y %H:%M}\n\n")
-            for c in cmds: f.write(c["texto"] + "\n\n")
+            for c in cmds:
+                f.write(c["texto"] + "\n\n")
 
-        fila_path.write_text(json.dumps({"gerado_em": agora_iso(), "service": self.SERVICE_NAME,
+        fila_path.write_text(json.dumps({
+            "gerado_em": agora_iso(), "service": self.SERVICE_NAME,
             "filtro_classe": label_filtro or "TODAS",
             "total_processos": len(todos), "total_comandos": cn,
-            "comandos": [{"num": c["num"], "processos": c["processos"], "tipo": c["tipo"]} for c in cmds]
+            "comandos": [{"num": c["num"], "processos": c["processos"], "tipo": c["tipo"]} for c in cmds],
         }, ensure_ascii=False, indent=2), encoding='utf-8')
 
-        # Copiar para nomes padrão para compatibilidade com auto_analisar.py
         if label_filtro:
             import shutil
             shutil.copy2(comandos_path, self.comandos_path)
@@ -191,17 +186,18 @@ class FilaBase:
         print(f"\n  {cn} comandos -> {comandos_path}")
 
     def status(self):
-        """Barra de progresso."""
         ck = self._ck()
         done = len(ck.get("processos_analisados", {}))
         ult = ck.get("ultimo_comando", 0)
         tc = tp = 0
         if self.fila_path.exists():
             fl = json.loads(self.fila_path.read_text())
-            tc, tp = fl.get("total_comandos",0), fl.get("total_processos",0)
-        pct = done/tp*100 if tp else 0
-        bar = "#" * int(pct//2.5) + "-" * (40-int(pct//2.5))
+            tc, tp = fl.get("total_comandos", 0), fl.get("total_processos", 0)
+        pct = done / tp * 100 if tp else 0
+        bar = "#" * int(pct // 2.5) + "-" * (40 - int(pct // 2.5))
         print(f"\n  [{bar}] {pct:.1f}%\n  Processos: {done}/{tp} | Comandos: {ult}/{tc}")
-        if ult < tc: print(f"  > Proximo: #{ult+1:03d}")
-        elif tc: print("  COMPLETO!")
+        if ult < tc:
+            print(f"  > Proximo: #{ult+1:03d}")
+        elif tc:
+            print("  COMPLETO!")
         print()

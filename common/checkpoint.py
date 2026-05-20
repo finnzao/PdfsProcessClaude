@@ -22,7 +22,6 @@ class CheckpointManager:
         self.path.write_text(json.dumps(ck, ensure_ascii=False, indent=2), encoding='utf-8')
 
     def marcar_concluido(self, cmd_num, processos, resultado_path=""):
-        """Registra comando como feito e os processos associados."""
         ck = self.carregar()
         if cmd_num not in ck["comandos_concluidos"]:
             ck["comandos_concluidos"].append(cmd_num)
@@ -42,5 +41,6 @@ class CheckpointManager:
         return self.carregar().get("ultimo_comando", 0)
 
     def reset(self):
-        if self.path.exists(): self.path.unlink()
+        if self.path.exists():
+            self.path.unlink()
         print("  Checkpoint resetado.")

@@ -1,248 +1,129 @@
-"""
-test_extratores.py — Teste rápido de sanidade dos extratores.
-Roda em alguns segundos. Não substitui pytest, mas valida que o pipeline
-inteiro processa um markdown sintético e produz a saída esperada.
+"""Testes dos extratores utilitarios (cautelar e qualificacao)."""
 
-Roda a partir da raiz do projeto:
-    python -m services.cautelares_get_info.scripts.tests.test_extratores
-ou diretamente:
-    python services/cautelares_get_info/scripts/tests/test_extratores.py
-"""
+import unittest
 
-import sys
-import json
-from pathlib import Path
-
-# Sobe 4 níveis: tests/ → scripts/ → cautelares_get_info/ → services/ → raiz
-RAIZ_PROJETO = Path(__file__).resolve().parents[4]
-if str(RAIZ_PROJETO) not in sys.path:
-    sys.path.insert(0, str(RAIZ_PROJETO))
-
-from utils.extrator_qualificacao import extrair_qualificacao_reu
-from utils.extrator_cautelar import extrair_cautelar
-from utils.tipos_pecas import classificar_peca
-
-MD_SINTETICO = """# 8001234-56.2024.8.05.0216
-**Classe:** APOrd
-**Assunto:** Roubo Majorado
-**Órgão julgador:** Vara Criminal de Rio Real
-**Réu/Executado:** JOAO DA SILVA SANTOS
-**Total de páginas:** 45
-**Peças identificadas:** 8
-
----
-
-## BO (p.1-3) — Num. 440866900 (p.1-3)
-
-Boletim de Ocorrência Nº 12345/2024
-
-Qualificação do(a) Indiciado(a):
-Nome: JOAO DA SILVA SANTOS
-CPF: 123.456.789-00
-RG: 12.345.678 SSP/BA
-Filiação: Maria da Silva Santos e José da Silva Santos
-Data de nascimento: 15/05/1990
-Naturalidade: Rio Real/BA
-Nacionalidade: Brasileira
-Estado civil: Solteiro
-Profissão: Pedreiro
-Escolaridade: Fundamental incompleto
-Telefone: (75) 99999-1234
-Endereço: Rua das Flores, 123, Centro, Rio Real/BA, CEP: 48340-000
-
-Vítima:
-Nome: MARIA OLIVEIRA
-CPF: 987.654.321-00
-Telefone: (75) 98888-4321
-
-## DENÚNCIA (p.5-7) — Num. 440866922 (p.1-3)
-
-O MINISTÉRIO PÚBLICO DO ESTADO DA BAHIA, vem oferecer a presente DENÚNCIA
-em face de:
-
-JOAO DA SILVA SANTOS, brasileiro, solteiro, pedreiro, RG 12.345.678 SSP/BA,
-CPF 123.456.789-00, residente na Rua das Flores, 123, Centro, Rio Real/BA.
-
-Como incurso nas sanções do Art. 157, §2º-A, do Código Penal.
-
-## AUDIENCIA_CUSTODIA (p.10-15) — Num. 440867200 (p.1-6)
-
-Aos 16 dias do mês de março de 2024, realizada a audiência de custódia
-do conduzido JOAO DA SILVA SANTOS.
-
-Presentes o Ministério Público e o Defensor Público.
-
-DECISÃO:
-
-Concedo liberdade provisória ao conduzido, nos termos do Art. 321 do CPP,
-mediante as seguintes medidas cautelares (Art. 319 CPP):
-
-I — comparecimento mensal ao juízo;
-III — proibição de contato com a vítima;
-IV — proibição de ausentar-se da comarca por mais de 7 dias.
-
-Expeça-se alvará de soltura.
-
-## DESPACHO (p.20) — Num. 440868000 (p.1)
-
-Cite-se o réu para apresentar resposta à acusação no prazo legal.
-"""
+from utils.extrator_cautelar import extrair_cautelares
+from utils.extrator_qualificacao import extrair_qualificacao
+from utils.formatadores import (
+    formatar_cpf,
+    formatar_telefone,
+    formatar_data_br,
+    titulizar,
+)
+from utils.tipos_pecas import normalizar_tipo_peca
 
 
-# ── Caso 2: sursis processual homologado SEM cumprimento ─────────
+class TestFormatadores(unittest.TestCase):
+    def test_cpf_valido(self):
+        self.assertEqual(formatar_cpf("12345678901"), "123.456.789-01")
 
-MD_SURSIS_PENDENTE = """# 8002345-67.2023.8.05.0216
-**Classe:** APSum
-**Assunto:** Lesão Corporal Leve
-**Réu/Executado:** ANA MARIA OLIVEIRA
+    def test_cpf_ja_formatado(self):
+        self.assertEqual(formatar_cpf("123.456.789-01"), "123.456.789-01")
 
----
+    def test_cpf_invalido_devolve_strip(self):
+        self.assertEqual(formatar_cpf("123"), "123")
 
-## DENÚNCIA (p.3-5) — Num. 440877000 (p.1-3)
+    def test_telefone_11_digitos(self):
+        self.assertEqual(formatar_telefone("11987654321"), "(11) 98765-4321")
 
-Indiciado: ANA MARIA OLIVEIRA, CPF 222.333.444-55, residente em Rio Real/BA.
+    def test_telefone_10_digitos(self):
+        self.assertEqual(formatar_telefone("1133334444"), "(11) 3333-4444")
 
-## SURSIS_PROCESSUAL (p.20-22) — Num. 440878000 (p.1-3)
+    def test_telefone_com_ddi(self):
+        self.assertEqual(formatar_telefone("5511987654321"), "(11) 98765-4321")
 
-Em audiência designada para o art. 89 da Lei 9.099/95, foi proposta e aceita
-a suspensão condicional do processo.
+    def test_data_br_formatos_variados(self):
+        self.assertEqual(formatar_data_br("01/02/2024"), "01/02/2024")
+        self.assertEqual(formatar_data_br("1-2-2024"), "01/02/2024")
+        self.assertEqual(formatar_data_br("01.02.2024"), "01/02/2024")
 
-Período de prova: 2 anos.
+    def test_data_br_ano_2_digitos(self):
+        # ano <=30 vira 20XX
+        self.assertEqual(formatar_data_br("01/02/24"), "01/02/2024")
+        # ano >30 vira 19XX
+        self.assertEqual(formatar_data_br("01/02/85"), "01/02/1985")
 
-Condições:
-- Comparecimento mensal ao juízo;
-- Não ausentar-se da comarca por mais de 7 dias sem autorização;
-- Reparar o dano à vítima no prazo de 60 dias.
-
-Suspendo o processo. Aguarde-se cumprimento.
-
-Data: 10/03/2023.
-"""
-
-
-def test_classificar():
-    print("\n── Teste: classificar_peca ──")
-    casos = [
-        ("OFEREÇO A PRESENTE DENÚNCIA contra Fulano", "DENÚNCIA"),
-        ("Concedo liberdade provisória ao conduzido, nos termos do Art. 321 do CPP", "LIBERDADE_PROVISORIA"),
-        ("Audiência de custódia realizada na presença do MP", "AUDIENCIA_CUSTODIA"),
-        ("Cumprido o período de prova, declaro extinta a punibilidade", "CUMPRIMENTO_SURSIS"),
-        ("Boletim de Ocorrência Nº 12345/2024", "BO"),
-        ("Suspensão condicional do processo, art. 89 da Lei 9.099", "SURSIS_PROCESSUAL"),
-        ("DECRETO A PRISÃO PREVENTIVA do réu", "PREVENTIVA"),
-    ]
-    ok = 0
-    for texto, esperado in casos:
-        tipo, score = classificar_peca(texto)
-        sucesso = tipo == esperado
-        if sucesso:
-            ok += 1
-        print(f"  {'✓' if sucesso else '✗'} {esperado:25} got={tipo:25} score={score}")
-    print(f"  Total: {ok}/{len(casos)}")
-    return ok == len(casos)
+    def test_titulizar_respeita_conectivos(self):
+        self.assertEqual(titulizar("JOAO DA SILVA"), "Joao da Silva")
+        self.assertEqual(titulizar("MARIA DOS SANTOS"), "Maria dos Santos")
 
 
-def test_qualificacao():
-    print("\n── Teste: extrair_qualificacao_reu (caso completo) ──")
-    dados = extrair_qualificacao_reu(MD_SINTETICO)
-    print(f"  Nome:         {dados.nome}")
-    print(f"  CPF:          {dados.cpf}")
-    print(f"  RG:           {dados.rg}")
-    print(f"  Mãe:          {dados.nome_mae}")
-    print(f"  Pai:          {dados.nome_pai}")
-    print(f"  Nascimento:   {dados.data_nascimento}")
-    print(f"  Naturalidade: {dados.naturalidade}")
-    print(f"  Estado civil: {dados.estado_civil}")
-    print(f"  Profissão:    {dados.profissao}")
-    print(f"  Telefone:     {dados.telefone}")
-    print(f"  CEP:          {dados.cep}")
-    print(f"  Logradouro:   {dados.logradouro}")
-    print(f"  Cidade:       {dados.cidade}")
-    print(f"  Campos preenchidos: {dados.campos_preenchidos()}/18")
+class TestNormalizarTipoPeca(unittest.TestCase):
+    def test_aliases_comuns(self):
+        self.assertEqual(normalizar_tipo_peca("denuncia"), "DENUNCIA")
+        self.assertEqual(normalizar_tipo_peca("denúncia"), "DENUNCIA")
+        self.assertEqual(normalizar_tipo_peca("BO"), "BOLETIM_OCORRENCIA")
+        self.assertEqual(normalizar_tipo_peca("APF"), "AUTO_PRISAO_FLAGRANTE")
+        self.assertEqual(normalizar_tipo_peca("sentença"), "SENTENCA")
 
-    # Asserções importantes
-    erros = []
-    if "JOAO" not in dados.nome.upper():
-        erros.append(f"nome esperado JOAO DA SILVA, got: {dados.nome}")
-    if dados.cpf != "123.456.789-00":
-        erros.append(f"CPF errado: {dados.cpf}")
-    # Crítico: NÃO deve ter capturado o CPF da vítima (987.654.321-00)
-    if "987" in dados.cpf:
-        erros.append("CPF da VÍTIMA foi capturado como sendo do réu — falha grave")
-    # Telefone não deve ser o da vítima
-    if "8888" in dados.telefone:
-        erros.append("telefone da vítima foi capturado")
+    def test_canonico_passa_direto(self):
+        self.assertEqual(normalizar_tipo_peca("DENUNCIA"), "DENUNCIA")
 
-    if erros:
-        for e in erros:
-            print(f"  ✗ {e}")
-        return False
-    print("  ✓ Sem mistura réu/vítima")
-    return True
+    def test_desconhecido_vira_doc(self):
+        self.assertEqual(normalizar_tipo_peca("qualquer-coisa"), "DOC")
+        self.assertEqual(normalizar_tipo_peca(""), "DOC")
 
 
-def test_cautelar_ativa():
-    print("\n── Teste: extrair_cautelar (cautelar ATIVA) ──")
-    dados = extrair_cautelar(MD_SINTETICO)
-    print(f"  Status:           {dados.status}")
-    print(f"  Imposta:          {dados.imposta}")
-    print(f"  Peça-fonte:       {dados.peca_fonte}")
-    print(f"  Periodicidade:    {dados.periodicidade}")
-    print(f"  Data imposição:   {dados.data_imposicao}")
-    print(f"  Condições:        {dados.condicoes}")
-    print(f"  Confiança:        {dados.confianca}")
+class TestExtrairCautelares(unittest.TestCase):
+    def test_comparecimento_mensal(self):
+        r = extrair_cautelares("o reu devera fazer comparecimento mensal ao juizo")
+        self.assertTrue(r["comparecimento_mensal"])
 
-    erros = []
-    if dados.status != "ATIVA":
-        erros.append(f"status esperado ATIVA, got: {dados.status}")
-    if dados.periodicidade != "mensal":
-        erros.append(f"periodicidade: {dados.periodicidade}")
-    if not dados.imposta:
-        erros.append("deveria estar imposta")
+    def test_proibicao_contato_vitima(self):
+        r = extrair_cautelares("Fica proibido o contato com a vitima Maria")
+        self.assertTrue(r["proibicao_contato_vitima"])
 
-    if erros:
-        for e in erros:
-            print(f"  ✗ {e}")
-        return False
-    print("  ✓ Cautelar ATIVA detectada corretamente")
-    return True
+    def test_monitoracao_eletronica(self):
+        r = extrair_cautelares("Determino o uso de tornozeleira eletronica")
+        self.assertTrue(r["monitoracao_eletronica"])
+
+    def test_fianca(self):
+        r = extrair_cautelares("Arbitra-se fianca no valor de R$ 5.000,00")
+        self.assertTrue(r["fianca"])
+
+    def test_outras_quando_cita_319_sem_padrao_especifico(self):
+        r = extrair_cautelares("Aplico medida do art. 319 do CPP em condicoes a serem definidas")
+        self.assertTrue(r["outras"])
+
+    def test_texto_vazio(self):
+        r = extrair_cautelares("")
+        self.assertFalse(any(v for k, v in r.items() if isinstance(v, bool)))
+
+    def test_trechos_capturados(self):
+        r = extrair_cautelares("Recolhimento noturno no periodo das 22h as 6h")
+        self.assertTrue(r["recolhimento_noturno"])
+        self.assertEqual(len(r["trechos"]), 1)
+        self.assertIn("Recolhimento", r["trechos"][0]["trecho"])
 
 
-def test_cautelar_suspeita():
-    print("\n── Teste: extrair_cautelar (sursis sem cumprimento → SUSPEITA_ATIVA) ──")
-    dados = extrair_cautelar(MD_SURSIS_PENDENTE)
-    print(f"  Status:           {dados.status}")
-    print(f"  Periodicidade:    {dados.periodicidade}")
-    print(f"  Período prova:    {dados.periodo_prova}")
-    print(f"  Confiança:        {dados.confianca}")
-    print(f"  Sinalizadores:    {dados.sinalizadores}")
+class TestExtrairQualificacao(unittest.TestCase):
+    def test_extrai_nome_e_cpf(self):
+        texto = "Nome: JOAO DA SILVA SANTOS\nCPF: 12345678901\nRG: 1234567 SSP/BA"
+        r = extrair_qualificacao(texto)
+        self.assertEqual(r["nome"], "Joao da Silva Santos")
+        self.assertEqual(r["cpf"], "123.456.789-01")
+        self.assertIn("1234567", r["rg"])
 
-    if dados.status not in ("ATIVA", "SUSPEITA_ATIVA"):
-        print(f"  ✗ esperado ATIVA ou SUSPEITA_ATIVA, got: {dados.status}")
-        return False
-    if not dados.imposta:
-        print("  ✗ deveria estar imposta (sursis cria cautelar)")
-        return False
-    print("  ✓ Sursis sem cumprimento foi tratado como ainda ativo")
-    return True
+    def test_extrai_data_nascimento_e_filiacao(self):
+        texto = (
+            "Nome: MARIA SANTOS\n"
+            "Data de nascimento: 15/03/1990\n"
+            "Mae: ANA SANTOS\n"
+        )
+        r = extrair_qualificacao(texto)
+        self.assertEqual(r["data_nascimento"], "15/03/1990")
+        self.assertEqual(r["filiacao_mae"], "Ana Santos")
+
+    def test_extrai_telefone(self):
+        texto = "Nome: TESTE\nTelefone: (71) 98765-4321"
+        r = extrair_qualificacao(texto)
+        self.assertEqual(r["telefone"], "(71) 98765-4321")
+
+    def test_texto_vazio(self):
+        r = extrair_qualificacao("")
+        self.assertEqual(r["nome"], "")
+        self.assertEqual(r["cpf"], "")
 
 
 if __name__ == "__main__":
-    print("=" * 60)
-    print("  Testes de sanidade — extractores SCC v2")
-    print("=" * 60)
-
-    resultados = [
-        test_classificar(),
-        test_qualificacao(),
-        test_cautelar_ativa(),
-        test_cautelar_suspeita(),
-    ]
-
-    print("\n" + "=" * 60)
-    if all(resultados):
-        print(f"  TODOS OS TESTES PASSARAM ({sum(resultados)}/{len(resultados)})")
-        sys.exit(0)
-    else:
-        print(f"  FALHAS: {len(resultados) - sum(resultados)}/{len(resultados)}")
-        sys.exit(1)
+    unittest.main()

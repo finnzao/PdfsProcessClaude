@@ -7,18 +7,9 @@ import re
 from pathlib import Path
 
 
-# ========================================================
-#   Diretorios
-# ========================================================
-
 def ensure_dir(path):
-    """Cria diretorio se nao existir."""
     Path(path).mkdir(parents=True, exist_ok=True)
 
-
-# ========================================================
-#   JSON
-# ========================================================
 
 def ler_json(path, default=None):
     p = Path(path)
@@ -36,12 +27,7 @@ def salvar_json(path, dados):
     p.write_text(json.dumps(dados, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-# ========================================================
-#   Formatacao de tamanho e tempo
-# ========================================================
-
 def formato_tamanho(bytes_):
-    """Bytes -> string legivel."""
     for unidade in ["B", "KB", "MB", "GB"]:
         if bytes_ < 1024:
             return f"{bytes_:.1f}{unidade}"
@@ -50,7 +36,6 @@ def formato_tamanho(bytes_):
 
 
 def formato_tempo(segundos):
-    """Segundos -> string legivel."""
     if segundos < 60:
         return f"{segundos:.1f}s"
     minutos = int(segundos // 60)
@@ -62,15 +47,8 @@ def formato_tempo(segundos):
     return f"{horas}h{minutos:02d}m{seg:02d}s"
 
 
-# ========================================================
-#   Parsing de nomes de arquivo (CNJ)
-# ========================================================
-
 def extrair_numero_processo(nome_arquivo: str) -> str:
-    """
-    Extrai numero CNJ do nome de um arquivo PDF ou MD.
-    Aceita formatos com ponto, hifen ou underscore como separadores.
-    """
+    """Extrai numero CNJ de nome de arquivo PDF ou MD."""
     padrao = re.search(
         r"(\d{7})[-_.]?(\d{2})[_.](\d{4})[_.](\d{1,2})[_.](\d{2})[_.](\d{4})",
         nome_arquivo,
@@ -85,24 +63,16 @@ def extrair_numero_processo(nome_arquivo: str) -> str:
 
 
 def num_para_arquivo(numero: str, ext: str = ".md") -> str:
-    """CNJ -> nome de arquivo (substitui . e - por _)."""
     return numero.replace(".", "_").replace("-", "_") + ext
 
-
-# ========================================================
-#   Formatacao de doc_ids
-# ========================================================
 
 def formatar_doc_ids(doc_ids):
     """
     Consolida lista de [(num, pag)...] em notacao compacta.
-    [('54543','1'),('54543','2'),('54543','3'),('53977','1')]
-      -> 'Num. 54543 (p.1-3), Num. 53977 (p.1)'
     """
     if not doc_ids:
         return ""
 
-    # Agrupa paginas por num_doc preservando ordem
     ordem = []
     por_num = {}
     for item in doc_ids:
@@ -121,7 +91,6 @@ def formatar_doc_ids(doc_ids):
             ordem.append(num)
         por_num[num].append(p)
 
-    # Comprime paginas em ranges contiguos
     partes = []
     for num in ordem:
         pags = sorted(set(por_num[num]))
@@ -143,12 +112,7 @@ def formatar_doc_ids(doc_ids):
     return ", ".join(partes)
 
 
-# ========================================================
-#   Texto helpers
-# ========================================================
-
 def primeira_linha(texto: str, max_chars: int = 120) -> str:
-    """Primeira linha 'significativa' de um texto."""
     for linha in texto.split("\n"):
         limpa = linha.strip().strip("#").strip("*").strip()
         if len(limpa) > 10:

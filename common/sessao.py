@@ -11,7 +11,8 @@ class SessaoManager:
         self.path = ck_path
 
     def _load(self):
-        if self.path.exists(): return json.loads(self.path.read_text(encoding='utf-8'))
+        if self.path.exists():
+            return json.loads(self.path.read_text(encoding='utf-8'))
         return {"criado_em": datetime.now().isoformat(), "ultima_atualizacao": "",
                 "processos_analisados": {}, "comandos_concluidos": [], "ultimo_comando": 0, "sessoes": []}
 
@@ -21,7 +22,6 @@ class SessaoManager:
         self.path.write_text(json.dumps(ck, ensure_ascii=False, indent=2), encoding='utf-8')
 
     def inicio(self):
-        """Abre uma sessão."""
         ck = self._load()
         ult = ck.get("ultimo_comando", 0)
         ck.setdefault("sessoes", []).append({"inicio": datetime.now().isoformat(), "fim": None, "cmd_inicio": ult})
@@ -29,11 +29,11 @@ class SessaoManager:
         print(f"\n  🟢 SESSÃO #{len(ck['sessoes'])} — Retomar do comando #{ult+1:03d}\n")
 
     def fim(self, fila_path=None):
-        """Fecha a sessão atual."""
         ck = self._load()
         ss = ck.get("sessoes", [])
         if not ss or ss[-1].get("fim"):
-            print("  ⚠️  Nenhuma sessão aberta."); return
+            print("  ⚠️  Nenhuma sessão aberta.")
+            return
         agora = datetime.now()
         ss[-1]["fim"] = agora.isoformat()
         ss[-1]["cmd_fim"] = ck.get("ultimo_comando", 0)

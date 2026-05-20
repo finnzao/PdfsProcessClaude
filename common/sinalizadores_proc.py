@@ -1,9 +1,11 @@
 """
 common/sinalizadores_proc.py — Deteccao proativa de dados estruturados.
 
-Enquanto o classificador rotula PECAS por tipo, este modulo CAPTURA dados
-especificos (CPFs, telefones, datas, sinais de cautelar) que ajudam a montar
-o cabecalho do markdown final e dao ao Claude um diagnostico pre-pronto.
+Captura dados especificos (CPFs, telefones, datas, sinais de cautelar)
+que ajudam a montar o cabecalho do markdown final.
+
+Verbos decisorios (Decido/Defiro/Indefiro/Concedo/Revogo) tem prioridade
+sobre cabecalhos formais ou preambulos genericos.
 """
 
 import re
@@ -23,6 +25,18 @@ RE_TELEFONE = re.compile(
 RE_CEP = re.compile(r"\b(\d{5}-?\d{3})\b")
 RE_DATA = re.compile(r"\b(\d{1,2})[/\-](\d{1,2})[/\-](\d{4})\b")
 
+# Frases com verbos decisorios — sinal forte de evento processual
+RE_VERBOS_DECISORIOS = re.compile(
+    r"\b(?:Decido|Defiro|Indefiro|Concedo|Revogo|Homologo|Decreto|Declaro|Absolvo|Condeno)\b",
+    re.I,
+)
+
+# Cabecalhos/preambulos a ignorar para inferencia de evento
+RE_PREAMBULO_RUIDO = re.compile(
+    r"^(?:VISTOS|RELATORIO|RELATÓRIO|EMENTA|ACÓRDÃO|ACORDAO)\b",
+    re.I | re.M,
+)
+
 
 # ========================================================
 #   Helpers
@@ -41,21 +55,15 @@ def _coletar_unicos(matches, max_itens=10):
     return out
 
 
-# ========================================================
-#   Deteccao de dados pessoais
-# ========================================================
-
 def detectar_dados_pessoais(texto: str) -> dict:
-    """Varredura de CPFs, telefones, RGs, CEPs e datas."""
     cpfs = _coletar_unicos(RE_CPF.findall(texto))
     rgs = _coletar_unicos(RE_RG.findall(texto), max_itens=5)
     ceps = _coletar_unicos(RE_CEP.findall(texto), max_itens=5)
 
-    # Telefones
     tels_brutos = RE_TELEFONE.findall(texto)
     tels_formatados = []
     for ddd, meio, fim in tels_brutos:
-        if ddd in ("19", "20"):  # falsos positivos comuns
+        if ddd in ("19", "20"):
             continue
         meio_limpo = meio.replace(" ", "")
         tels_formatados.append(f"({ddd}) {meio_limpo}-{fim}")
@@ -76,7 +84,7 @@ def detectar_dados_pessoais(texto: str) -> dict:
 
 
 # ========================================================
-#   Deteccao de eventos cautelares
+#   Eventos cautelares
 # ========================================================
 
 TIPOS_CAUTELARES = {
@@ -97,16 +105,32 @@ TIPOS_CAUTELARES = {
 }
 
 
-def _primeira_frase_significativa(texto: str, max_chars: int = 200) -> str:
+def _trecho_decisorio(texto: str, max_chars: int = 200) -> str:
+    """
+    Procura primeira frase com verbo decisorio. Se nao houver,
+    cai para a primeira linha significativa ignorando preambulos.
+    """
+    # Procura linha com verbo decisorio
     for linha in texto.split("\n"):
         l = linha.strip().strip("#").strip("*").strip()
-        if len(l) >= 20:
+        if len(l) < 15:
+            continue
+        if RE_VERBOS_DECISORIOS.search(l):
             return l[:max_chars]
+
+    # Fallback: primeira linha significativa, pulando preambulos
+    for linha in texto.split("\n"):
+        l = linha.strip().strip("#").strip("*").strip()
+        if len(l) < 20:
+            continue
+        if RE_PREAMBULO_RUIDO.match(l):
+            continue
+        return l[:max_chars]
+
     return texto[:max_chars].strip()
 
 
 def detectar_eventos_cautelares(grupos: list) -> dict:
-    """Indexa eventos cautelares dos grupos de pecas."""
     indice = {v: False for v in TIPOS_CAUTELARES.values()}
     indice["eventos"] = []
 
@@ -115,7 +139,8 @@ def detectar_eventos_cautelares(grupos: list) -> dict:
         if tipo in TIPOS_CAUTELARES:
             indice[TIPOS_CAUTELARES[tipo]] = True
 
-            datas = RE_DATA.findall(g.get("texto", "")[:5000])
+            texto = g.get("texto", "")
+            datas = RE_DATA.findall(texto[:5000])
             primeira_data = (
                 f"{datas[0][0]}/{datas[0][1]}/{datas[0][2]}" if datas else None
             )
@@ -128,17 +153,15 @@ def detectar_eventos_cautelares(grupos: list) -> dict:
                 ),
                 "doc_ids": g.get("doc_ids", []),
                 "data_detectada": primeira_data,
-                "trecho": _primeira_frase_significativa(g.get("texto", "")),
+                "trecho": _trecho_decisorio(texto),
             })
 
     return indice
 
 
 def detectar_sinalizadores_processuais(grupos: list) -> dict:
-    """Sumario de alto nivel para o cabecalho do markdown."""
     eventos = detectar_eventos_cautelares(grupos)
 
-    # Inferir fase aparente
     if eventos["tem_transito_julgado"]:
         fase = "Sentenciado com trânsito em julgado"
     elif eventos["tem_extincao_punibilidade"] or eventos.get("tem_cumprimento_sursis") or eventos.get("tem_cumprimento_anpp"):
@@ -156,7 +179,6 @@ def detectar_sinalizadores_processuais(grupos: list) -> dict:
     else:
         fase = "Sem eventos de cautelar identificados"
 
-    # Provavel status da cautelar de comparecimento
     if eventos["tem_extincao_punibilidade"] or eventos["tem_transito_julgado"]:
         status = "EXTINTA (cessou com sentença/extinção)"
     elif eventos.get("tem_cumprimento_sursis") or eventos.get("tem_cumprimento_anpp"):

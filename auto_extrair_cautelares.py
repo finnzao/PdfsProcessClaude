@@ -43,10 +43,6 @@ IS_WINDOWS = platform.system() == "Windows"
 
 # ── Detecção de rate limit ──────────────────────────────────────────
 
-# Padrões reconhecidos:
-#   "You've hit your limit · resets 1pm (America/Fortaleza)"
-#   "Rate limit exceeded. Resets at 11:30am (UTC)"
-#   "Usage limit reached, resets 6pm"
 RE_RATE_LIMIT = re.compile(
     r"(?:hit\s+your\s+limit|rate[\s_-]*limit|usage[\s_-]*limit)"
     r"[^\n]{0,80}?reset(?:s)?(?:\s+at)?\s+"
@@ -54,7 +50,6 @@ RE_RATE_LIMIT = re.compile(
     re.IGNORECASE,
 )
 
-# Timezone explícita: "(America/Fortaleza)"
 RE_TIMEZONE = re.compile(r"\(([A-Za-z_]+/[A-Za-z_]+)\)")
 
 
@@ -87,7 +82,7 @@ def calcular_tempo_espera(rate_info: dict) -> tuple[float, datetime]:
     agora = datetime.now(tz=tz)
     alvo = agora.replace(
         hour=rate_info["hora"], minute=rate_info["minuto"],
-        second=30, microsecond=0,  # 30s de margem
+        second=30, microsecond=0,
     )
     if alvo <= agora:
         alvo += timedelta(days=1)
@@ -164,7 +159,6 @@ def verificar_claude_code() -> str:
 # ── Controle global de processos ────────────────────────────────────
 
 def carregar_controle() -> dict:
-    """Lê processos_claude_code.json — fonte da verdade do progresso."""
     if CONTROLE_PATH.exists():
         try:
             return json.loads(CONTROLE_PATH.read_text(encoding="utf-8"))
@@ -178,7 +172,6 @@ def carregar_controle() -> dict:
 
 
 def processos_ja_extraidos() -> set[str]:
-    """Retorna set de numero_processo já extraídos (do controle global)."""
     return set(carregar_controle().get("processos", {}).keys())
 
 
@@ -193,7 +186,7 @@ def carregar_checkpoint() -> dict:
     return {
         "criado_em": datetime.now().isoformat(),
         "comandos_concluidos": [],
-        "comandos_parciais": {},  # {num: [processos_feitos]}
+        "comandos_parciais": {},
         "ultimo_comando": 0,
     }
 
@@ -213,7 +206,6 @@ def marcar_concluido(num: int, processos: list[str]) -> None:
         ck["comandos_concluidos"].sort()
     if num > ck.get("ultimo_comando", 0):
         ck["ultimo_comando"] = num
-    # Limpa parcial — agora está completo
     ck.get("comandos_parciais", {}).pop(str(num), None)
     salvar_checkpoint(ck)
     total_extraidos = len(processos_ja_extraidos())
@@ -222,7 +214,6 @@ def marcar_concluido(num: int, processos: list[str]) -> None:
 
 
 def marcar_parcial(num: int, processos_feitos: list[str], processos_pendentes: list[str]) -> None:
-    """Registra que o CMD foi parcial — alguns processos OK, outros pendentes."""
     ck = carregar_checkpoint()
     ck.setdefault("comandos_parciais", {})[str(num)] = {
         "feitos": sorted(processos_feitos),
@@ -274,12 +265,6 @@ def encontrar_bloco(num: int, blocos: list[str]) -> str | None:
 # ── Verificação de resultados ───────────────────────────────────────
 
 def verificar_resultado(num: int, processos: list[str]) -> tuple[str, str, list[str]]:
-    """
-    Verifica progresso do CMD via processos_claude_code.json (fonte da verdade)
-    e o JSON do CMD em si.
-
-    Retorna ('OK'|'PARCIAL'|'ERRO', mensagem, processos_pendentes).
-    """
     extraidos = processos_ja_extraidos()
     feitos = [p for p in processos if p in extraidos]
     pendentes = [p for p in processos if p not in extraidos]
@@ -315,12 +300,6 @@ def executar_comando(
     timeout: int = 600,
     verbose: bool = False,
 ) -> tuple[str, str, list[str]]:
-    """
-    Executa um comando via `claude -p`.
-    Retorna (status, info, processos_pendentes).
-    Status: 'OK' | 'PARCIAL' | 'ERRO' | 'RATE_LIMIT' | 'TIMEOUT'.
-    Para RATE_LIMIT, info é o dict com horário de reset.
-    """
     extraidos_antes = processos_ja_extraidos()
     pendentes_antes = [p for p in processos if p not in extraidos_antes]
 
@@ -332,31 +311,24 @@ def executar_comando(
     print(f"  {', '.join(processos)}")
     print(f"{'=' * 60}")
 
-    # Se não há nada a fazer, marcar como OK direto
     if not pendentes_antes:
         return "OK", "todos já extraídos antes deste run", []
 
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     log_file = LOG_DIR / f"cmd_{num:03d}.log"
 
-    # Salva o prompt em arquivo temp e usa stdin para evitar problemas
-    # de escape de shell no Windows (parênteses, quebras, etc.)
     prompt_file = LOG_DIR / f"cmd_{num:03d}.prompt.txt"
     prompt_file.write_text(texto_cmd, encoding="utf-8")
 
-    # Em Windows, claude.cmd precisa shell=True; em Linux/Mac, não.
-    # Mas em Windows, passamos o prompt via stdin (não via -p "...")
-    # para evitar truncamento por escape de shell.
     cmd = [
         claude_path,
-        "-p",                              # modo print (não interativo)
-        "--permission-mode", "acceptEdits",  # auto-aprova Read/Write/Edit
+        "-p",
+        "--permission-mode", "acceptEdits",
         "--output-format", "text",
     ]
 
     t0 = time.time()
     try:
-        # Lê o prompt como stdin
         with open(prompt_file, "r", encoding="utf-8") as f_stdin:
             if verbose:
                 process = subprocess.Popen(
@@ -389,10 +361,8 @@ def executar_comando(
         dt = time.time() - t0
         mins, segs = int(dt // 60), int(dt % 60)
 
-        # Verifica rate limit ANTES de avaliar sucesso
         rate_info = detectar_rate_limit(output)
         if rate_info:
-            # Mesmo se travou por rate limit, pode ter processado alguns
             status, msg, pendentes = verificar_resultado(num, processos)
             extraidos_durante = set(processos) - set(pendentes) - set(p for p in processos if p in extraidos_antes)
             if extraidos_durante:
@@ -409,7 +379,6 @@ def executar_comando(
         else:
             print(f"  ✗ ERRO em {mins}m{segs:02d}s: {msg}")
             print(f"     Log: {log_file}")
-            # Diagnóstico: se falhou rápido (<30s) sem extrair nada, mostra preview
             if dt < 30 and not verbose:
                 preview = output[:600] if output else "(saída vazia)"
                 print(f"     ── Preview do log ──")
@@ -426,7 +395,6 @@ def executar_comando(
         print(f"  ✗ TIMEOUT após {int(dt // 60)}m{int(dt % 60):02d}s")
         if verbose and 'process' in locals():
             process.kill()
-        # Mesmo com timeout, alguns podem ter sido processados
         status, msg, pendentes = verificar_resultado(num, processos)
         if status == "PARCIAL":
             print(f"  ⓘ Apesar do timeout, {len(processos) - len(pendentes)} foram extraídos")
@@ -503,7 +471,6 @@ def main():
             continue
         if args.ate and n > args.ate:
             continue
-        # Pula CMD se TODOS os processos dele já estão extraídos
         if all(p in extraidos_inicio for p in cmd["processos"]):
             cmds_skip_total += 1
             continue
@@ -554,7 +521,6 @@ def main():
             i += 1
             continue
 
-        # Loop de tentativas (rate limit não conta como tentativa falha)
         tentativas = 0
         sucesso_final = False
         while tentativas < args.max_tentativas:
@@ -572,12 +538,11 @@ def main():
 
             elif status == "RATE_LIMIT":
                 rate_limits += 1
-                # Marca o que já foi feito antes do rate limit
                 feitos = [p for p in procs if p not in procs_pendentes]
                 if feitos:
                     marcar_parcial(n, feitos, procs_pendentes)
                 aguardar_rate_limit(info, n)
-                tentativas -= 1  # Rate limit não conta como tentativa
+                tentativas -= 1
                 continue
 
             elif status == "PARCIAL":
@@ -610,7 +575,6 @@ def main():
                   f"resultados/extracao/extracao_{n:03d}.json")
             break
 
-        # Pausa entre comandos
         if i + 1 < len(pendentes):
             time.sleep(args.pausa)
 

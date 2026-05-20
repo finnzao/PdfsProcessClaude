@@ -35,11 +35,9 @@ IS_WINDOWS = platform.system() == "Windows"
 
 def _find_claude():
     """Encontra o executavel do Claude Code, incluindo .cmd no Windows."""
-    # Tentar direto
     p = shutil.which("claude")
     if p:
         return p
-    # Windows: npm instala como claude.cmd
     if IS_WINDOWS:
         p = shutil.which("claude.cmd")
         if p:
@@ -289,7 +287,6 @@ Exemplos:
     print(f"  AUTO-ANALISAR — Claude Code (claude -p)")
     print(f"{'='*60}\n")
 
-    # Verificar Claude Code
     claude_path = verificar_claude_code()
 
     fila = carregar_fila()
@@ -396,7 +393,6 @@ Exemplos:
         print(f"  COMPLETO!")
     print(f"{'='*60}")
 
-    # Consolidar planilha ao final se solicitado
     if args.consolidar and ok > 0:
         consolidar_triagem()
     elif args.consolidar and ok == 0:

@@ -1,18 +1,12 @@
 #!/usr/bin/env python3
 """
 consolidar_analise.py — Consolida triagens JSON em planilha priorizada.
-
-Gera uma planilha única ordenada por prioridade (score composto),
-com colunas de filtro por executor, meta, risco, etc.
-
-Prioridade: Prescrição > Congestionamento > Réu preso > Outras
-Score: impacto_meta × facilidade_ato
 """
 
-import json, csv
+import json
+import csv
 from pathlib import Path
 
-# Importar scoring se disponível, senão usar fallback inline
 try:
     from common.scoring import (
         calcular_prioridade, nivel_prioridade,
@@ -24,9 +18,8 @@ except ImportError:
 
 
 def _fallback_prioridade(d):
-    """Calcula prioridade sem o módulo scoring (para rodar standalone)."""
     risco = d.get("risco_prescricao", "SEM RISCO")
-    dias = int(d.get("dias_parado", 0)) if str(d.get("dias_parado", "0")).replace("-","").isdigit() else 0
+    dias = int(d.get("dias_parado", 0)) if str(d.get("dias_parado", "0")).replace("-", "").isdigit() else 0
     preso = d.get("reu_preso", False)
     urg = d.get("urgencia_crime", d.get("urgencia", "MEDIA"))
 
@@ -57,7 +50,6 @@ def _fallback_prioridade(d):
 
 
 def carregar_triagens(resultados_dir: Path) -> list:
-    """Carrega todos os JSONs de triagem e retorna lista unificada."""
     jsons = sorted(resultados_dir.glob("triagem_*.json"))
     if not jsons:
         print("  Nenhum arquivo de triagem encontrado.")
@@ -87,11 +79,10 @@ def carregar_triagens(resultados_dir: Path) -> list:
 
 
 def enriquecer_e_ordenar(dados: list) -> list:
-    """Adiciona campos de priorização e ordena por score decrescente."""
     for d in dados:
         proximo_ato = d.get("proximo_ato", "")
         risco = d.get("risco_prescricao", "SEM RISCO")
-        dias = int(d.get("dias_parado", 0)) if str(d.get("dias_parado", "0")).replace("-","").isdigit() else 0
+        dias = int(d.get("dias_parado", 0)) if str(d.get("dias_parado", "0")).replace("-", "").isdigit() else 0
         preso = d.get("reu_preso", False)
         if isinstance(preso, str):
             preso = preso.lower() in ("true", "sim", "s", "1")
@@ -110,8 +101,10 @@ def enriquecer_e_ordenar(dados: list) -> list:
             score, meta = _fallback_prioridade(d)
             d["score_prioridade"] = score
             d["meta_principal"] = meta
-            if "executor" not in d: d["executor"] = "Verificar"
-            if "facilidade_ato" not in d: d["facilidade_ato"] = 3
+            if "executor" not in d:
+                d["executor"] = "Verificar"
+            if "facilidade_ato" not in d:
+                d["facilidade_ato"] = 3
 
             if score >= 15000: d["nivel_prioridade"] = "URGENTÍSSIMA"
             elif score >= 10000: d["nivel_prioridade"] = "URGENTE"
@@ -124,10 +117,9 @@ def enriquecer_e_ordenar(dados: list) -> list:
 
 
 def gerar_xlsx(dados: list, path: Path):
-    """Gera planilha .xlsx com formatação profissional e filtros."""
     try:
         from openpyxl import Workbook
-        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side, numbers
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
         from openpyxl.utils import get_column_letter
     except ImportError:
         print("  openpyxl não encontrado. Gerando CSV como fallback.")
@@ -138,7 +130,6 @@ def gerar_xlsx(dados: list, path: Path):
     ws = wb.active
     ws.title = "Priorização"
 
-    # ── Estilos ──
     header_font = Font(name="Arial", bold=True, color="FFFFFF", size=11)
     header_fill = PatternFill("solid", fgColor="1F3864")
     header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
@@ -151,7 +142,6 @@ def gerar_xlsx(dados: list, path: Path):
         bottom=Side(style="thin", color="D9D9D9"),
     )
 
-    # Cores por nível de prioridade
     cores_nivel = {
         "URGENTÍSSIMA": (PatternFill("solid", fgColor="8B0000"), Font(name="Arial", size=10, bold=True, color="FFFFFF")),
         "URGENTE":      (PatternFill("solid", fgColor="FF0000"), Font(name="Arial", size=10, bold=True, color="FFFFFF")),
@@ -176,7 +166,6 @@ def gerar_xlsx(dados: list, path: Path):
         "Verificar":   PatternFill("solid", fgColor="F2F2F2"),
     }
 
-    # ── Colunas ──
     colunas = [
         ("Nº",             "numero",            8),
         ("Prioridade",     "nivel_prioridade",  14),
@@ -196,7 +185,6 @@ def gerar_xlsx(dados: list, path: Path):
         ("Peças-Chave",    "pecas_chave",        35),
     ]
 
-    # ── Cabeçalho ──
     for col_idx, (titulo, _, largura) in enumerate(colunas, 1):
         cell = ws.cell(row=1, column=col_idx, value=titulo)
         cell.font = header_font
@@ -206,35 +194,28 @@ def gerar_xlsx(dados: list, path: Path):
         ws.column_dimensions[get_column_letter(col_idx)].width = largura
 
     ws.freeze_panes = "A2"
-    ws.auto_filter.ref = f"A1:{get_column_letter(len(colunas))}{len(dados) + 1}"
+    if dados:
+        ws.auto_filter.ref = f"A1:{get_column_letter(len(colunas))}{len(dados) + 1}"
 
-    # ── Dados ──
     for row_idx, d in enumerate(dados, 2):
         for col_idx, (_, campo, _) in enumerate(colunas, 1):
             valor = d.get(campo, "")
 
-            # Converter booleano
             if campo == "reu_preso":
                 if isinstance(valor, bool):
                     valor = "SIM" if valor else "NÃO"
                 elif isinstance(valor, str):
                     valor = "SIM" if valor.lower() in ("true", "sim", "s", "1") else "NÃO"
 
-            # Converter facilidade para texto legível
             if campo == "facilidade_ato":
                 fac_map = {5: "5-Trivial", 4: "4-Simples", 3: "3-Médio", 2: "2-Complexo", 1: "1-Pesado"}
                 valor = fac_map.get(int(valor) if str(valor).isdigit() else 3, str(valor))
-
-            # Número do processo: só os 7 primeiros dígitos + ano para ficar legível
-            if campo == "numero" and isinstance(valor, str) and len(valor) > 20:
-                pass  # manter completo para filtro
 
             cell = ws.cell(row=row_idx, column=col_idx, value=valor)
             cell.font = cell_font
             cell.alignment = cell_align
             cell.border = thin_border
 
-        # ── Cores condicionais ──
         nivel = d.get("nivel_prioridade", "NORMAL")
         if nivel in cores_nivel:
             fill, font = cores_nivel[nivel]
@@ -251,14 +232,10 @@ def gerar_xlsx(dados: list, path: Path):
         if executor in cores_executor:
             ws.cell(row=row_idx, column=5).fill = cores_executor[executor]
 
-        # Réu preso em vermelho
         preso_val = ws.cell(row=row_idx, column=12).value
         if preso_val == "SIM":
             ws.cell(row=row_idx, column=12).fill = PatternFill("solid", fgColor="FF0000")
             ws.cell(row=row_idx, column=12).font = Font(name="Arial", size=10, bold=True, color="FFFFFF")
-
-    # ── Linha de totais no topo (linha 2 seria dados, então usar rodapé) ──
-    # Não adicionar, pois atrapalha os filtros
 
     path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(path)
@@ -266,7 +243,6 @@ def gerar_xlsx(dados: list, path: Path):
 
 
 def _fallback_csv(dados: list, path: Path):
-    """Fallback CSV quando openpyxl não está disponível."""
     saida = path.with_suffix(".csv")
     campos = [
         "numero", "nivel_prioridade", "score_prioridade", "meta_principal",
@@ -282,35 +258,28 @@ def _fallback_csv(dados: list, path: Path):
 
 
 def gerar_resumo(dados: list):
-    """Imprime resumo estatístico da triagem."""
     total = len(dados)
     if not total:
         return
 
-    # Por nível
     niveis = {}
     for d in dados:
         n = d.get("nivel_prioridade", "?")
         niveis[n] = niveis.get(n, 0) + 1
 
-    # Por executor
     executores = {}
     for d in dados:
         e = d.get("executor", "?")
         executores[e] = executores.get(e, 0) + 1
 
-    # Por meta
     metas = {}
     for d in dados:
         m = d.get("meta_principal", "?")
         metas[m] = metas.get(m, 0) + 1
 
-    # Prescrição
     prescritos = sum(1 for d in dados if d.get("risco_prescricao") == "PRESCRITO")
     iminentes = sum(1 for d in dados if d.get("risco_prescricao") == "IMINENTE")
     atencao = sum(1 for d in dados if d.get("risco_prescricao") == "ATENCAO")
-
-    # Réu preso
     presos = sum(1 for d in dados if d.get("reu_preso") in (True, "true", "SIM", "sim", "True"))
 
     print(f"\n  {'─'*50}")
@@ -343,7 +312,6 @@ def gerar_resumo(dados: list):
 
 
 class ConsolidarAnalise:
-    """Consolida resultados de análise em planilha priorizada."""
 
     def __init__(self, service_dir: Path, result_dir: Path):
         self.resultados_dir = service_dir / "resultados"

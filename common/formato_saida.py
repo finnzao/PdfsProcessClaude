@@ -1,6 +1,5 @@
 """
 formato_saida.py — Define o formato de saída que o Claude Code deve gerar.
-Usado pelos geradores de comandos para incluir as instruções corretas.
 """
 
 INSTRUCAO_SAIDA = """
@@ -130,5 +129,4 @@ Exemplo: 0000770-14.2020.8.05.0216 -> 0000770_14_2020_8_05_0216.md
 
 
 def instrucao_para_comando(num_comando: int) -> str:
-    """Retorna a instrução de saída formatada para um comando específico."""
     return INSTRUCAO_SAIDA.replace("{cmd}", f"{num_comando:03d}")

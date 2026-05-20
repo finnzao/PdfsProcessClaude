@@ -1,494 +1,263 @@
-# Pipeline de Extração de Custodiados — Vara Criminal de Rio Real
+# Litispendência — Análise em lote (CPC 337)
 
-Pipeline automatizado que usa o **Claude Code** para ler markdowns de processos
-criminais e extrair dados dos custodiados (réus com cautelar de comparecimento
-periódico — Art. 319, I CPP) para cadastro no sistema ACLP.
+Pipeline de triagem automatizada de **litispendência**, **coisa julgada**,
+**conexão** e **continência** sobre processos cíveis já agrupados pelo seu
+script `gerar_relatorios_litispendencia_1_.py`.
 
----
-
-## Sumário
-
-1. [Workflow em 3 comandos](#workflow-em-3-comandos)
-2. [Como funciona](#como-funciona)
-3. [Comandos detalhados](#comandos-detalhados)
-4. [Arquivos gerados](#arquivos-gerados)
-5. [Tratamento de rate limit](#tratamento-de-rate-limit)
-6. [Salvamento incremental e retomada](#salvamento-incremental-e-retomada)
-7. [Planilha final](#planilha-final)
-8. [Solução de problemas](#solução-de-problemas)
+Segue o mesmo padrão dos outros services do projeto (`analisar_processo`,
+`cautelares_get_info`): integra com `run.py`, usa `CheckpointManager` e
+`SessaoManager` da `common/`, e tem runner separado na raiz.
 
 ---
 
-## Workflow em 3 comandos
+## 🔧 Correção crítica do `services/__init__.py`
+
+**Este pacote inclui um `services/__init__.py` corrigido**. O original
+estava com imports do `cautelares_get_info` no nível do pacote, o que
+quebra **qualquer** comando que toca `services.*` — não só o do
+litispendência.
+
+O novo `__init__.py` está vazio (só docstring), no padrão de pacotes
+"guarda-chuva". Cada sub-service expõe suas funções por conta própria
+no seu próprio `__init__.py`. Isso destrava todos os services.
+
+---
+
+## Decisões de design
+
+### 1. Granularidade adaptativa (1 CMD ≠ 1 grupo, mas 1 grupo é a unidade)
+
+Olhando a distribuição real dos grupos (110 com 2-3 procs, 6 com 6-10,
+2 com 11+), 1 grupo por CMD desperdiçaria startup do `claude -p` 110 vezes
+para análises leves. Mas botar grupos grandes juntos prejudicaria a
+atenção do modelo na comparação dos pares.
+
+A solução: **agrupar grupos consecutivos no mesmo CMD enquanto a soma de
+processos ≤ 6; grupos com 6+ processos ficam isolados**. Resultado:
+~50-55 CMDs em vez de 122, sem perder qualidade.
+
+A **unidade de retomada continua sendo o grupo** (via `controle_grupos.json`).
+Se o CMD trava no meio, o que já foi feito permanece registrado e na
+próxima execução só os grupos faltantes do CMD são reprocessados.
+
+### 2. Abas processadas por default
+
+Apenas `⭐ Litispendência` e `⚠ Coisa Julgada` — as duas abas que seu
+filtro pré-classificador identifica como mais relevantes (122 + 57 grupos).
+As outras três (Estrito, Médio, Amplo) totalizam 1000+ grupos com muito
+ruído e podem ser processadas via flag se quiser auditar.
+
+### 3. Schema com sub-grupos
+
+Litispendência num grupo grande raramente é binária. Pode haver 2 pares
+de litispendência + 4 processos distintos. O schema permite:
+- `pares_litispendencia[]` — múltiplos pares dentro do mesmo grupo
+- `processos_distintos[]` — falsos positivos com justificativa
+- `processos_coisa_julgada[]` — apartado para o caso da aba ⚠
+
+### 4. Regras jurídicas embutidas no prompt
+
+- **Rótulo ≠ causa de pedir** — dois CumSenFaz entre as mesmas partes
+  podem executar sentenças diferentes
+- **Processo mais antigo prevalece** (CPC 240) — identificado no JSON
+- **Documentos faltantes** → `INDEFINIDO` com `confianca: BAIXA`, nunca
+  inventa dados
+
+---
+
+## Estrutura
+
+```
+PDFSPROCESSCLAUDE/
+├── auto_analisar_litispendencia.py     ← runner (espelha auto_extrair_cautelares.py)
+├── services/
+│   ├── __init__.py                     ← CORRIGIDO (sem imports)
+│   └── litispendencia/
+│       ├── __init__.py
+│       ├── main.py                     ← integra com run.py
+│       ├── prompts/
+│       │   └── prompt_litispendencia.md
+│       ├── scripts/
+│       │   ├── __init__.py
+│       │   ├── fila_litispendencia.py
+│       │   └── consolidar_litispendencia.py
+│       ├── resultados/grupos/          ← grupo_<id>.json (Claude escreve)
+│       ├── logs/                       ← cmd_NNN.log do runner
+│       ├── fila.json                   ← gerado por `fila`
+│       ├── comandos_claude_code.txt    ← gerado por `fila`
+│       ├── checkpoint.json             ← CheckpointManager padrão
+│       └── controle_grupos.json        ← controle granular (estilo cautelares)
+└── files/
+    └── litispendencia.xlsx             ← entrada (renomeie sua planilha)
+```
+
+---
+
+## Workflow
 
 ```bash
-# 1. Gera fila de comandos (lote de 2 processos cada)
-python run.py cautelares fila-extracao
+# 1. Renomeie sua planilha para files/litispendencia.xlsx
+#    (ou passe --xlsx no comando fila)
 
-# 2. Roda batch — Claude Code lê os markdowns e extrai os dados
-python auto_extrair_cautelares.py --consolidar
+# 2. Gere a fila
+python run.py litispendencia fila
 
-# 3. (Opcional, já incluído no --consolidar do passo 2) Gera planilha xlsx
-python run.py cautelares consolidar-extracao
-```
+# 3. Rode o batch (com consolidação ao final)
+python auto_analisar_litispendencia.py --consolidar
 
-**Atalho:** o `--consolidar` no passo 2 já gera a planilha automaticamente ao
-final, então você só precisa de **2 comandos** na prática.
-
----
-
-## Como funciona
-
-```
-textos_extraidos/*.md
-        │
-        ▼  (1) Gera fila ignorando processos já extraídos
-fila_extracao.json + comandos_extracao.txt
-        │
-        ▼  (2) Claude Code roda em batch (incremental + retry de rate limit)
-resultados/extracao/extracao_NNN.json   ← append a cada processo
-processos_claude_code.json              ← append a cada processo
-        │
-        ▼  (3) Consolida todos os JSONs e gera planilha
-result/cautelares_get_info/custodiados_cadastro.xlsx
-```
-
-Cada CMD processa **2 processos** por vez. O Claude Code:
-1. Lê o `processos_claude_code.json` para saber quais processos já foram feitos
-2. Para cada `.md` na lista, extrai os dados do(s) réu(s)
-3. **Salva imediatamente** no `extracao_NNN.json` após cada processo
-4. **Atualiza** o `processos_claude_code.json` com o número do processo
-5. Só então passa para o próximo `.md`
-
----
-
-## Comandos detalhados
-
-### `python run.py cautelares fila-extracao`
-
-**O que faz:** Lê todos os `.md` em `textos_extraidos/`, ignora os processos que
-já estão em `processos_claude_code.json`, e gera comandos em batches de 2.
-
-**Saída:**
-- `services/cautelares_get_info/fila_extracao.json` — metadados da fila
-- `services/cautelares_get_info/comandos_extracao.txt` — comandos prontos
-
-**Exemplo:**
-```bash
-$ python run.py cautelares fila-extracao
-  Markdowns encontrados:    53
-  Já extraídos (controle):  2
-  Pendentes a processar:    51
-  ✓ Fila gerada
-  Total: 26 comandos com até 2 processos cada
-```
-
-**Filtros opcionais:**
-```bash
-# Filtra por prefixo do número do processo
-python run.py cautelares fila-extracao -- --filtro=8001
-
-# Reprocessa TUDO (mesmo já extraídos)
-python run.py cautelares fila-extracao -- --forcar
-
-# Usa pasta diferente de textos_extraidos
-python run.py cautelares fila-extracao -- /caminho/outra/pasta
+# Saída: result/litispendencia/triagem_litispendencia.xlsx
 ```
 
 ---
 
-### `python auto_extrair_cautelares.py`
+## Comandos do `run.py`
 
-**O que faz:** Executa os comandos da fila em sequência via Claude Code CLI.
+| Comando | O que faz |
+|---------|-----------|
+| `fila` | Gera `fila.json` + `comandos_claude_code.txt` a partir do xlsx |
+| `status` | Mostra progresso (CMDs feitos vs total, grupos analisados) |
+| `analisar` | Abre sessão de trabalho (`SessaoManager`) |
+| `pausa` | Fecha sessão de trabalho |
+| `marcar <N> <ids...>` | Marca CMD concluído manualmente |
+| `consolidar` | Gera planilha xlsx final |
+| `reset` | Limpa fila + checkpoint (preserva resultados e controle) |
+| `limpar-controle` | Zera `controle_grupos.json` (com backup, requer `--confirmar`) |
 
-**Comportamento:**
-- Pula CMDs cujos processos já estão todos no controle global
-- Detecta rate limit e espera o reset automaticamente
-- Salva log de cada CMD em `services/cautelares_get_info/logs/cmd_NNN.log`
-- Tenta até 3 vezes em caso de erro (configurável)
-- Pode ser interrompido com Ctrl+C — retoma de onde parou
-
-**Saída padrão (sem flags):**
-```bash
-============================================================
-  CMD 001 | 2 processos no batch
-  0000101-29.2018.8.05.0216, 0000114-96.2016.8.05.0216
-============================================================
-  ✓ OK em 2m13s | todos os 2 processos extraídos
-  ✓ Checkpoint: CMD #001 concluído | Total geral: 2 processos extraídos
-```
-
-**Flags úteis:**
-
-| Flag | O que faz |
-|---|---|
-| `--max N` | Roda só os primeiros N comandos (útil para teste) |
-| `--de N` | Começa do comando N |
-| `--ate N` | Para no comando N |
-| `--dry` | Preview — mostra o que seria feito sem executar |
-| `--verbose` | Mostra a saída do Claude em tempo real |
-| `--consolidar` | Gera a planilha xlsx ao final |
-| `--pausa N` | Segundos de pausa entre comandos (padrão: 5) |
-| `--timeout N` | Timeout por comando em segundos (padrão: 600 = 10min) |
-| `--max-tentativas N` | Tentativas por CMD em caso de erro (padrão: 3) |
-| `--continuar-em-erro` | Não para se um CMD falhar |
-
-**Exemplos:**
-```bash
-# Teste com 1 comando, vendo a saída do Claude em tempo real
-python auto_extrair_cautelares.py --max 1 --verbose
-
-# Roda os comandos 5 a 10
-python auto_extrair_cautelares.py --de 5 --ate 10
-
-# Roda tudo e gera a planilha ao final
-python auto_extrair_cautelares.py --consolidar
-
-# Preview do que seria feito
-python auto_extrair_cautelares.py --dry
-
-# Roda mesmo com erros (não para)
-python auto_extrair_cautelares.py --continuar-em-erro --consolidar
-```
-
----
-
-### `python run.py cautelares status-extracao`
-
-**O que faz:** Mostra o progresso atual da extração.
-
-**Pode ser rodado a qualquer momento**, inclusive enquanto o batch está
-executando em outro terminal.
-
-**Saída:**
-```
-  ── Status da extração ──
-  [###############-------------------------] 38.5%
-  Comandos:  10/27 concluídos | 1 parciais
-  Processos: 20/53 extraídos
-  Total geral no controle: 22 processos
-
-  ── CMDs parciais (alguns processos faltam) ──
-  CMD 011: 1 feitos / 1 pendentes
-
-  Próximo CMD pendente: ~011
-  Retomar com: python auto_extrair_cautelares.py
-```
-
----
-
-### `python run.py cautelares consolidar-extracao`
-
-**O que faz:** Lê todos os `extracao_*.json`, valida os dados e gera a planilha
-final em `result/cautelares_get_info/custodiados_cadastro.xlsx`.
-
-**Pode ser rodado:**
-- Após o batch terminar
-- Em qualquer momento para gerar uma planilha parcial
-- Várias vezes (sobrescreve a anterior)
-
-**Saída:**
-```
-  Lendo: services/cautelares_get_info/resultados/extracao
-  53 registros encontrados
-
-  ── Resumo ──
-  Total:      53
-  ✓ PRONTO:    18  (importador consome direto)
-  ⚠ REVISAR:   12  (humano analisa antes)
-  ✗ BLOQUEADO: 23  (descartado)
-
-  ✓ Planilha: result/cautelares_get_info/custodiados_cadastro.xlsx
-```
-
----
-
-### `python run.py cautelares marcar-extracao <NUM>`
-
-**O que faz:** Marca manualmente um CMD como concluído.
-
-**Quando usar:** Se você rodou um comando do Claude Code manualmente (fora do
-auto-runner) e quer registrar isso no checkpoint.
+### Flags do `fila`
 
 ```bash
-python run.py cautelares marcar-extracao 5
+python run.py litispendencia fila --xlsx=files/outra.xlsx
+python run.py litispendencia fila --abas="⭐ Litispendência,⚠ Coisa Julgada,Filtro Estrito"
+python run.py litispendencia fila --forcar    # ignora controle_grupos.json
 ```
+
+### Flags do `auto_analisar_litispendencia.py`
+
+| Flag | Default | O que faz |
+|------|---------|-----------|
+| `--de N` | 0 | Começa do CMD N |
+| `--ate N` | 0 | Para no CMD N (0 = até o fim) |
+| `--max N` | 0 | Máximo de CMDs nesta execução |
+| `--dry` | off | Preview: lista o que rodaria sem chamar Claude |
+| `--pausa S` | 5 | Segundos entre CMDs |
+| `--timeout S` | 900 | Timeout por CMD |
+| `--verbose` | off | Imprime stdout do Claude em tempo real |
+| `--continuar-em-erro` | off | Não interrompe o batch quando um CMD falha |
+| `--max-tentativas N` | 3 | Retries por CMD (rate limit não conta) |
+| `--consolidar` | off | Roda o consolidador ao final |
 
 ---
 
-### `python run.py cautelares reset-extracao`
+## Schema do JSON por grupo
 
-**O que faz:** Limpa a fila e o checkpoint, mas **preserva**:
-- Os JSONs em `resultados/extracao/`
-- O `processos_claude_code.json` (controle global)
+Cada `services/litispendencia/resultados/grupos/grupo_<id>.json`:
 
-**Quando usar:** Quando você quer regenerar a fila com filtros diferentes ou
-recomeçar o batch sem perder os dados já extraídos.
+```json
+{
+  "group_id": "lit_042",
+  "aba_origem": "⭐ Litispendência",
+  "n_processos": 3,
+  "processos": ["0000123-...", "0000789-...", "0000999-..."],
+  "processos_sem_md": [],
 
-```bash
-python run.py cautelares reset-extracao
+  "classificacao_final": "LITISPENDENCIA_PARCIAL",
+  "confianca": "ALTA",
+  "prioridade": "URGENTE",
+  "executor": "magistrado",
+  "facilidade_ato": 4,
+
+  "pares_litispendencia": [
+    {
+      "processos": ["0000123-...", "0000789-..."],
+      "tipo": "LITISPENDENCIA_TOTAL",
+      "justificativa": "Ambos executam a sentença do processo X..."
+    }
+  ],
+  "processos_distintos": [
+    {
+      "numero": "0000999-...",
+      "justificativa": "Mesmas partes, executa sentença diferente."
+    }
+  ],
+  "processos_coisa_julgada": [],
+
+  "processo_mais_antigo": "0000123-...",
+  "providencia_sugerida": "Extinguir o processo -789 (CPC 485 V).",
+  "observacoes": "..."
+}
 ```
+
+### Valores possíveis
+
+**`classificacao_final`**: `LITISPENDENCIA_TOTAL`, `LITISPENDENCIA_PARCIAL`,
+`COISA_JULGADA`, `CONEXAO`, `CONTINENCIA`, `CAUSAS_DISTINTAS`, `INDEFINIDO`.
+
+**`confianca`**: `ALTA`, `MEDIA`, `BAIXA`.
+
+**`prioridade`**: `URGENTE`, `ALTA`, `MEDIA`, `BAIXA`.
+
+**`executor`**: `magistrado`, `cartorio`, `assessoria`.
+
+**`facilidade_ato`**: 1 (complexo) a 5 (trivial).
 
 ---
 
-### `python run.py cautelares limpar-controle`
+## Planilha final (`triagem_litispendencia.xlsx`)
 
-**O que faz:** Zera o `processos_claude_code.json` (com backup automático).
+4 abas:
 
-⚠️ **Cuidado:** após isso, todos os processos vão ser considerados pendentes
-de novo na próxima geração de fila.
-
-```bash
-# Mostra aviso e instruções
-python run.py cautelares limpar-controle
-
-# Confirma e executa (gera backup .bkp_YYYYMMDD_HHMMSS.json)
-python run.py cautelares limpar-controle --confirmar
-```
-
----
-
-## Arquivos gerados
-
-```
-services/cautelares_get_info/
-├── fila_extracao.json              ← metadados da fila atual
-├── comandos_extracao.txt           ← comandos prontos para o Claude Code
-├── checkpoint_extracao.json        ← progresso do batch (CMDs OK/parciais)
-├── processos_claude_code.json      ← CONTROLE GLOBAL (granular por processo)
-│
-├── resultados/extracao/
-│   ├── extracao_001.json           ← array de processos do CMD 001
-│   ├── extracao_002.json           ← array de processos do CMD 002
-│   └── ...
-│
-└── logs/
-    ├── cmd_001.log                 ← stdout completo do Claude Code
-    ├── cmd_001.prompt.txt          ← prompt enviado para o CMD 001
-    └── ...
-```
-
-E na pasta `result/`:
-
-```
-result/cautelares_get_info/
-└── custodiados_cadastro.xlsx       ← planilha final para cadastro
-```
+| Aba | Conteúdo |
+|-----|----------|
+| **Resumo por Grupo** | 1 linha por grupo, com coloração condicional. Ordenada por prioridade depois por tamanho do grupo |
+| **Pares Litispendência** | 1 linha por par identificado. `group_id` preservado em todas (rastreabilidade) |
+| **Falsos Positivos** | Processos que o filtro agrupou mas a IA classificou como distintos |
+| **Estatísticas** | Contadores por classificação, prioridade, confiança e aba de origem |
 
 ---
 
 ## Tratamento de rate limit
 
-Quando você atinge o limite de tokens do plano Claude, o Claude Code retorna
-mensagens como:
+Quando o Claude retorna `You've hit your limit · resets Xpm`, o runner:
 
-```
-You've hit your limit · resets 1pm (America/Fortaleza)
-```
-
-O `auto_extrair_cautelares.py`:
-
-1. **Detecta automaticamente** via regex (várias variantes suportadas)
-2. **Calcula o tempo até o reset** respeitando o timezone informado
-3. **Mostra contador regressivo** no terminal:
-   ```
-   ============================================================
-     RATE LIMIT DETECTADO
-   ============================================================
-     Mensagem do Claude:   hit your limit · resets 1pm
-     Aguardando até:       06/05/2026 13:00:30 -03
-     Tempo total de espera: 75min 23s
-     Comando interrompido: CMD 008
-   ============================================================
-
-     Aguardando rate limit reset...  74min 12s
-   ```
-4. **Espera até reset + 30s de margem**
-5. **Retoma do mesmo CMD** automaticamente
-6. **Não conta como tentativa falha** (rate limit é tratado separadamente)
-
-Se a espera passar de 4h, ele avisa para você decidir se quer interromper com
-Ctrl+C e retomar mais tarde.
+1. Detecta via regex
+2. Calcula o tempo até o reset (timezone `America/Fortaleza`)
+3. Mostra contagem regressiva
+4. Espera até reset + 30s
+5. Retoma o CMD (sem contar como tentativa falha)
+6. Claude pula grupos já feitos via `controle_grupos.json`
 
 ---
 
-## Salvamento incremental e retomada
+## Cenários de retomada
 
-### Como o progresso é preservado
-
-O Claude Code é instruído a salvar **após cada processo**, não só no final do
-CMD. Isso garante que mesmo se travar no meio:
-
-**Cenário:** CMD 005 com 2 processos (A e B). Claude processa A, depois trava
-no meio de B (rate limit / timeout / erro).
-
-- ✅ `extracao_005.json` tem o objeto de A salvo
-- ✅ `processos_claude_code.json` lista A como extraído
-- ✅ B fica registrado como pendente
-
-**Ao retomar com `python auto_extrair_cautelares.py`:**
-- Runner detecta status **PARCIAL** no CMD 005 (1/2 feitos)
-- Re-executa CMD 005, mas Claude pula A (já está no controle) e só processa B
-- Append em `extracao_005.json` adiciona B sem duplicar A
-- CMD marcado como concluído
-
-### Granularidade
-
-| Arquivo | Granularidade | Atualizado por |
-|---|---|---|
-| `processos_claude_code.json` | Por **processo** | Claude Code (a cada processo) |
-| `checkpoint_extracao.json` | Por **CMD** | Runner (após CMD completo) |
-| `extracao_NNN.json` | Por **CMD** (array) | Claude Code (append por processo) |
+| Situação | O que fazer |
+|----------|-------------|
+| Travou no meio do batch | `python auto_analisar_litispendencia.py` — retoma do último CMD |
+| Rate limit batendo direto | Runner espera sozinho |
+| Refiz o filtro, planilha mudou | `python run.py litispendencia fila --forcar` |
+| Re-analisar 1 grupo específico | Apague `resultados/grupos/grupo_<id>.json` e a entrada em `controle_grupos.json`, depois rode o runner |
+| Auditar abas mais largas | `python run.py litispendencia fila --abas="Filtro Estrito"` |
+| Quero rodar só 5 CMDs de teste | `python auto_analisar_litispendencia.py --max 5 --dry` (preview), depois sem `--dry` |
 
 ---
 
-## Planilha final
-
-Arquivo: `result/cautelares_get_info/custodiados_cadastro.xlsx`
-
-Cada linha = 1 réu. A coluna **STATUS_CADASTRO** classifica em 3 cores:
-
-| Status | Cor | Significado |
-|---|---|---|
-| 🟢 **PRONTO** | Verde | Todos os campos OK, importador consome direto |
-| 🟡 **REVISAR** | Amarelo | Passa na validação mas tem pendências (telefone vazio, gaps em observações, cautelar SUSPEITA_ATIVA) |
-| 🔴 **BLOQUEADO** | Vermelho | Falta CPF/RG, dado obrigatório ausente, ou cautelar EXTINTA — descartar |
-
-### Validação aplicada
-
-**Bloqueia (vai pra 🔴):**
-- Sem `nome`
-- Sem CPF nem RG
-- Sem `processo`
-- Sem `dataDecisao`
-- Sem `periodicidade`
-- Sem `cep`, `logradouro`, `bairro` ou `cidade`
-- `estado` não é sigla UF de 2 letras
-- Cautelar EXTINTA / NUNCA_IMPOSTA / CONVERTIDA_PREVENTIVA
-
-**Marca como REVISAR (vai pra 🟡):**
-- Cautelar SUSPEITA_ATIVA ou VERIFICAR
-- Sem telefone (campo "Pendente")
-- Sem CPF (só RG)
-- Claude registrou observações com mais de 30 chars (sinal de gap)
-
-### Colunas principais
-
-| Coluna | Descrição |
-|---|---|
-| `STATUS_CADASTRO` | 🟢 PRONTO / 🟡 REVISAR / 🔴 BLOQUEADO |
-| `MOTIVO_REVISAO` | Lista os problemas encontrados |
-| `nome` | Nome completo do réu |
-| `cpf` / `rg` | Documentos |
-| `contato` | Telefone (ou "Pendente") |
-| `processo` | Número CNJ do processo |
-| `vara` / `comarca` | Vara Criminal de Rio Real |
-| `dataDecisao` | Data da imposição da cautelar (yyyy-MM-dd) |
-| `dataComparecimentoInicial` | Calculada (decisão + periodicidade) |
-| `periodicidade` | Dias entre comparecimentos |
-| `cep` → `estado` | Endereço completo |
-| `observacoes` | **Texto livre do Claude** com gaps e fontes |
-| `status_cautelar` | Diagnóstico (ATIVA, SUSPEITA_ATIVA, etc) |
-| `peca_fonte` / `pagina_fonte` | Onde os dados foram localizados |
-
-### Recursos da planilha
-
-- **Filtro automático** no cabeçalho (ative com Ctrl+Shift+L se desligado)
-- **Dropdowns de validação** nas colunas STATUS_CADASTRO e estado
-- **Painel congelado** nas duas primeiras colunas (STATUS + MOTIVO)
-- **Cores por grupo** no cabeçalho (operacional, pessoal, doc, processo, endereço, auxiliar)
-
----
-
-## Solução de problemas
-
-### "Claude Code não encontrado no PATH"
+## Pré-requisitos
 
 ```bash
-npm install -g @anthropic-ai/claude-code
-claude login
+pip install openpyxl
 ```
 
-### CMD falha rapidamente (< 30s) sem extrair nada
-
-O runner agora mostra um **preview do log** automaticamente nesse caso. Veja
-também o arquivo completo em `services/cautelares_get_info/logs/cmd_NNN.log`.
-
-Causas comuns:
-- Permissões de ferramentas — o runner usa `--permission-mode acceptEdits`
-- Versão antiga do Claude Code — atualize com `npm update -g @anthropic-ai/claude-code`
-
-### Quero refazer um CMD específico
-
-```bash
-# Apaga o JSON do CMD
-rm services/cautelares_get_info/resultados/extracao/extracao_005.json
-
-# Remove os processos desse CMD do controle global
-# (edite manualmente o processos_claude_code.json para remover as entradas)
-
-# Roda apenas esse CMD
-python auto_extrair_cautelares.py --de 5 --ate 5
-```
-
-### Quero limpar tudo e recomeçar do zero
-
-```bash
-# 1. Faz backup do que já foi extraído (recomendado)
-cp -r services/cautelares_get_info/resultados/extracao backup_extracao_$(date +%Y%m%d)
-
-# 2. Reset do batch
-python run.py cautelares reset-extracao
-
-# 3. Limpa o controle global (com backup automático)
-python run.py cautelares limpar-controle --confirmar
-
-# 4. Apaga os JSONs (cuidado!)
-rm services/cautelares_get_info/resultados/extracao/extracao_*.json
-
-# 5. Recomeça
-python run.py cautelares fila-extracao
-python auto_extrair_cautelares.py --consolidar
-```
-
-### Bati rate limit e ele esperou demais
-
-A espera é até o horário de reset informado pelo Claude. Se for muito longa
-(>4h), o runner avisa e você pode dar Ctrl+C, esperar manualmente, e retomar
-depois com `python auto_extrair_cautelares.py`.
-
-### O Claude está extraindo dados errados (réu vs vítima)
-
-Verifique o `prompt_extracao.md` em `services/cautelares_get_info/prompts/`. As
-regras de identificação de papel processual estão lá. Você pode ajustar e
-reprocessar os CMDs problemáticos.
+Claude Code instalado e no PATH (mesmo setup dos outros services).
 
 ---
 
-## Estrutura completa do projeto
+## O que NÃO está incluído
 
-```
-projeto/
-├── auto_extrair_cautelares.py       ← runner com retry de rate limit
-├── run.py                            ← CLI raiz (já existente)
-└── services/cautelares_get_info/
-    ├── main.py                       ← comandos do pipeline
-    ├── prompts/
-    │   ├── prompt_extracao.md        ← schema + regras (lido pelo Claude)
-    │   └── prompt_custodiado.md      ← prompt antigo (mantido)
-    ├── scripts/
-    │   ├── fila_extracao.py          ← gera fila
-    │   ├── consolidar_extracao.py    ← lê JSONs, valida, gera xlsx
-    │   ├── pre_extracao.py           ← antigo (regex, mantido)
-    │   └── consolidar.py             ← antigo (regex, mantido)
-    ├── resultados/
-    │   ├── extracao/                 ← JSONs extraídos pelo Claude
-    │   └── (outros arquivos antigos)
-    ├── logs/
-    │   ├── cmd_NNN.log               ← stdout do Claude Code
-    │   └── cmd_NNN.prompt.txt        ← prompt enviado
-    ├── fila_extracao.json            ← gerado por fila-extracao
-    ├── comandos_extracao.txt         ← gerado por fila-extracao
-    ├── checkpoint_extracao.json      ← progresso por CMD
-    └── processos_claude_code.json    ← controle global (granular)
-```
+- **Integração com `run.py`**: pressuponho que seu `run.py` já tem o
+  dispatcher genérico (`python run.py <service> <comando>` → chama
+  `services/<service>/main.py:executar(comando, args)`). Como você usa
+  esse padrão nos outros services, o de litispendência se encaixa
+  automaticamente.
+
+Se seu `run.py` precisar de uma entrada explícita para `litispendencia`,
+me avise que mando o trecho de código.
